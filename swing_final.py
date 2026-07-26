@@ -11,6 +11,8 @@ from datetime import datetime, timezone, date, timedelta
 import warnings
 warnings.filterwarnings("ignore")
 
+from overnight_policy import should_enter_swing_signal
+
 load_dotenv()
 
 API_KEY = os.getenv("ALPACA_API_KEY")
@@ -46,6 +48,9 @@ COOLDOWN_ORE = 24
 HMM_STARI = 3
 HMM_MIN_DATE = 100
 HMM_ITERATII = 50
+
+# Politica de swing: pastram pozitiile peste noapte si iesim doar pe semnale tehnice clare.
+HOLD_OVERNIGHT = True
 
 trades_azi = 0
 data_curenta = datetime.now().date()
@@ -504,13 +509,25 @@ def analizeaza_semnal(simbol, memorie):
         hmm_bullish = regim == "bullish"
         prob_bullish = info_hmm.get("prob_bullish", 0)
 
+        trend_strength = (ema20 - ema50) / ema50 if ema50 else 0
+        macd_strength = macd - signal
+        ema_gap_pct = abs(ema20 - ema50) / ema50 if ema50 else 0
+
         semnal = None
         motiv = ""
 
-        if (trend_bullish and rsi_ok and macd_bullish
-                and volum_ok and hmm_bullish
-                and prob_bullish > 0.5
-                and confirmat_4h):
+        if (
+            confirmat_4h
+            and should_enter_swing_signal(
+                trend_strength=trend_strength,
+                rsi_value=rsi,
+                macd_strength=macd_strength,
+                volume_ratio=volum_ratio,
+                ema_gap_pct=ema_gap_pct,
+                ema20_value=ema20,
+                bullish_hmm=hmm_bullish and prob_bullish > 0.5,
+            )
+        ):
             semnal = "long"
             motiv = (
                 f"HMM=BULLISH({prob_bullish:.0%}) | "
@@ -723,6 +740,7 @@ def agent():
     print(f"🧠 HMM {HMM_STARI} stari | Confirmare 1H+4H | Cooldown {COOLDOWN_ORE}h")
     print(f"💰 Max trade: ${MAX_TRADE_SIZE_USD} | Max pozitii: {MAX_POZITII}")
     print(f"🛑 SL={STOP_LOSS_PCT:.1%} | Trailing dupa {TAKE_PROFIT_INITIAL:.0%}")
+    print(f"🛏️  Hold overnight: {'DA' if HOLD_OVERNIGHT else 'NU'}")
     print(f"⏱️  Scanare la fiecare {INTERVAL_SCANARE // 60} minute")
     print("-" * 60)
 

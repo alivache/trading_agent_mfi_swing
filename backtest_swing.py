@@ -36,6 +36,9 @@ HMM_STARI = 3
 HMM_MIN_DATE = 100
 HMM_ITERATII = 30  # redus de la 50 pentru viteza
 
+# Politica de swing: pastram pozitiile peste noapte si iesim doar pe semnale tehnice clare.
+HOLD_OVERNIGHT = True
+
 
 # ═══════════════════════════════════════
 # HMM (identic cu swing_final.py)
@@ -276,6 +279,7 @@ def main():
     print("ATENTIE: poate dura 30-60 min")
     print("=" * 65 + "\n")
 
+    print(f"Politica overnight: {'DA' if HOLD_OVERNIGHT else 'NU'}")
     print("Descarc datele...")
     date_s = {}
     for s in ACTIUNI:
