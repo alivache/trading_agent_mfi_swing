@@ -1,143 +1,274 @@
-import yfinance as yf
-import alpaca_trade_api as tradeapi
+#!/usr/bin/env python3
+# multi_tf_strategy.py
+# Agent principal LIVE — strategie multi-timeframe (1D + 15m + 5m), long-only.
+# Bucla infinita, scanare la 60s. Nu moare niciodata.
 import os
 import sys
 import json
 import time
-import csv
+import traceback
+from datetime import datetime, timedelta, timezone
+
 import pandas as pd
+# yfinance eliminat - folosim Alpaca IEX
 from dotenv import load_dotenv
-from datetime import datetime, date, timedelta
+import alpaca_trade_api as tradeapi
 
-load_dotenv()
+# ─────────────────────────────────────────────────────────────
+# Output catre agent.log cu buffering=1 (tail -f vede imediat)
+# ─────────────────────────────────────────────────────────────
+FOLDER = os.path.dirname(os.path.abspath(__file__))
+LOG_PATH = os.path.join(FOLDER, "agent.log")
 
-# ═══════════════════════════════════════
-# REDIRECT OUTPUT CATRE agent.log
-# ═══════════════════════════════════════
-_log = open("/home/liviu_anton/trading/agent.log", "a", buffering=1)
-sys.stdout = _log
-sys.stderr = _log
+load_dotenv(os.path.join(FOLDER, ".env"))
 
-# ═══════════════════════════════════════
+
+def _redirect_log():
+    """Redirecteaza stdout/stderr spre agent.log. Doar cand rulam ca serviciu."""
+    _logfile = open(LOG_PATH, "a", buffering=1, encoding="utf-8")
+    sys.stdout = _logfile
+    sys.stderr = _logfile
+
+# ─────────────────────────────────────────────────────────────
 # CONFIGURARE
-# ═══════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-BASE_URL = os.getenv("ALPACA_BASE_URL")
+BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 MAX_TRADE_SIZE_USD = float(os.getenv("MAX_TRADE_SIZE_USD", 2500))
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", 10))
-
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", 100))
 ACTIUNI_RAW = os.getenv("ACTIUNI", "AAPL,MSFT,NVDA,GOOGL,AMZN,NFLX")
-ACTIUNI = [s.strip().upper() for s in ACTIUNI_RAW.split(",")]
-
 EARNINGS_RAW = os.getenv("EARNINGS", "")
+
+ACTIUNI = [s.strip().upper() for s in ACTIUNI_RAW.split(",") if s.strip()]
+
 EARNINGS_MANUAL = {}
-for item in EARNINGS_RAW.split(","):
-    if ":" in item:
-        sym, d = item.strip().split(":", 1)
+for parte in EARNINGS_RAW.split(","):
+    if ":" in parte:
+        sym, d = parte.split(":", 1)
         EARNINGS_MANUAL[sym.strip().upper()] = d.strip()
 
-ZILE_BLOCARE_EARNINGS = 1
-
-api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL)
-
-INTERVAL_SCANARE = 60
-MEMORIE_FILE = "/home/liviu_anton/trading/memorie_multitf.json"
-POZITII_FILE = "/home/liviu_anton/trading/pozitii_active.json"
-GRAFICE_CACHE_FILE = "/home/liviu_anton/trading/grafice_cache.json"
-
-# ═══════════════════════════════════════
-# PARAMETRI OPTIMIZATI (R1 + varianta A din backtest)
-# ═══════════════════════════════════════
-STOP_LOSS_PCT = 0.015
-TAKE_PROFIT_PCT = 0.040
-TRAILING_STOP_PCT = 0.010
-TRAILING_ACTIV_PCT = 0.015
-PULLBACK_MAX_15M = 0.02
-RSI_15M_MIN = 25
-RSI_15M_MAX = 60
-
-MAX_RISC_PORTOFOLIU = 0.01
+# ─────────────────────────────────────────────────────────────
+# PARAMETRI STRATEGIE (constante cu nume)
+# ─────────────────────────────────────────────────────────────
+SCAN_INTERVAL_SEC = 60
 MAX_POZITII = 5
-COOLDOWN_ORE = 4
+RISC_PORTOFOLIU_PCT = 0.01          # 1% risc pe portofoliu
+STOP_LOSS_MIN_PCT = 0.015           # stop loss minim 1.5%
+STOP_LOSS_PCT = 0.015               # stop loss fix -1.5%
+TAKE_PROFIT_PCT = 0.04              # +4%
+TRAILING_ACTIVARE_PCT = 0.015       # trailing se activeaza la +1.5%
+TRAILING_DISTANTA_PCT = 0.01        # iesire daca scade 1% de la max
+RSI_5M_EXIT = 78                    # iesire daca RSI(5m) > 78
+COOLDOWN_ORE = 4                    # cooldown 4h dupa o pierdere
+EARNINGS_BLOCARE_ZILE = 1           # blocheaza daca earnings in <= 1 zi
+STOP_INTRARI_ORE_INAINTE = 2        # fara intrari noi cu 2h inainte de inchidere
+INCHIDERE_MIN_INAINTE = 15          # inchide tot cu 15 min inainte de inchidere
+CACHE_GRAFICE_CICLURI = 5           # scrie cache grafice la fiecare 5 cicluri (bursa deschisa)
+CACHE_GRAFICE_CICLURI_INCHIS = 10   # la fiecare 10 cand bursa e inchisa
 
-MINUTE_INAINTE_CLOSE = 15
-ORE_STOP_INTRARI = 2  # Nu mai deschide pozitii noi in ultimele 2 ore
+# Fisiere de stare
+POZITII_FILE = os.path.join(FOLDER, "pozitii_active.json")
+MEMORIE_FILE = os.path.join(FOLDER, "memorie_multitf.json")
+GRAFICE_FILE = os.path.join(FOLDER, "grafice_cache.json")
 
-trades_azi = 0
-data_curenta = datetime.now().date()
-pozitii_deschise = {}
-raport_generat_azi = False
-inchidere_facuta_azi = False
-
-_earnings_cache = {}
-_earnings_cache_data = None
-
-
-# ═══════════════════════════════════════
-# POZITII ACTIVE (persistente la restart)
-# ═══════════════════════════════════════
-def incarca_pozitii_active():
-    if os.path.exists(POZITII_FILE):
-        try:
-            with open(POZITII_FILE, "r") as f:
-                poz = json.load(f)
-            if poz:
-                print(f"📥 Incarcat {len(poz)} pozitii active la pornire: {', '.join(poz.keys())}")
-            return poz
-        except Exception as e:
-            print(f"  Eroare incarcare pozitii: {e}")
-    return {}
+# ─────────────────────────────────────────────────────────────
+# API Alpaca
+# ─────────────────────────────────────────────────────────────
+api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2")
 
 
-def salveaza_pozitii_active():
+# ═════════════════════════════════════════════════════════════
+# INDICATORI (calculati manual cu pandas)
+# ═════════════════════════════════════════════════════════════
+def calculeaza_ema(preturi, perioada):
+    return pd.Series(preturi).ewm(span=perioada, adjust=False).mean().iloc[-1]
+
+
+def calculeaza_rsi(preturi, perioada=14):
+    """RSI cu medii SIMPLE (rolling), nu Wilder. Media pierderilor 0 -> 100."""
+    prices = pd.Series(preturi)
+    delta = prices.diff()
+    castig = delta.where(delta > 0, 0.0)
+    pierdere = -delta.where(delta < 0, 0.0)
+    avg_c = castig.rolling(window=perioada).mean().iloc[-1]
+    avg_p = pierdere.rolling(window=perioada).mean().iloc[-1]
+    if avg_p == 0:
+        return 100.0
+    rs = avg_c / avg_p
+    return 100 - (100 / (1 + rs))
+
+
+def calculeaza_atr(df, perioada=14):
+    high = df["High"]
+    low = df["Low"]
+    close_prev = df["Close"].shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - close_prev).abs(),
+        (low - close_prev).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(perioada).mean().iloc[-1]
+
+
+# Mapare timeframe yfinance -> Alpaca
+_TF_MAP = {"1d": "1Day", "15m": "15Min", "5m": "5Min"}
+_PERIOD_ZILE = {"200d": 300, "5d": 8, "1d": 3}
+
+
+def get_date(simbol, interval, period):
+    """Descarca OHLCV de la Alpaca IEX (nu yfinance — evita rate-limit).
+    Coloane compatibile cu restul codului: Open/High/Low/Close."""
+    from datetime import datetime, timedelta, timezone
+    tf = _TF_MAP.get(interval, "1Day")
+    zile = _PERIOD_ZILE.get(period, 30)
+    # end = acum - 16 min (planul gratuit nu da ultimele 15 min); format RFC3339 UTC
+    end = (datetime.now(timezone.utc) - timedelta(minutes=16)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    start = (datetime.now(timezone.utc) - timedelta(days=zile)).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
-        with open(POZITII_FILE, "w") as f:
-            json.dump(pozitii_deschise, f, indent=2, default=str)
+        bars = api.get_bars(simbol, tf, start=start, end=end, feed="iex").df
+        if bars is None or bars.empty:
+            return None
+        # Redenumeste coloanele ca sa fie compatibile (Open/High/Low/Close)
+        df = bars.rename(columns={
+            "open": "Open", "high": "High", "low": "Low",
+            "close": "Close", "volume": "Volume"
+        })
+        return df[["Open", "High", "Low", "Close", "Volume"]]
     except Exception as e:
-        print(f"  Eroare salvare pozitii: {e}")
+        print(f"  ⚠️ get_date {simbol} {interval}: {e}")
+        return None
 
 
-# ═══════════════════════════════════════
-# MEMORIE
-# ═══════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
+# LOGICA DE INTRARE — 3 timeframe-uri aliniate (short-circuit)
+# ═════════════════════════════════════════════════════════════
+def verifica_1d(simbol):
+    """Prets > EMA50 > EMA200 si 40 < RSI < 75."""
+    df = get_date(simbol, "1d", "200d")
+    if df is None or len(df) < 200:
+        return False, {"motiv": "date 1D insuficiente"}
+    inchideri = df["Close"].tolist()
+    pret = inchideri[-1]
+    ema50 = calculeaza_ema(inchideri, 50)
+    ema200 = calculeaza_ema(inchideri, 200)
+    rsi = calculeaza_rsi(inchideri, 14)
+    ok = (pret > ema50 > ema200) and (40 < rsi < 75)
+    return ok, {"pret": round(pret, 2), "ema50": round(ema50, 2),
+                "ema200": round(ema200, 2), "rsi": round(rsi, 1)}
+
+
+def verifica_15m(simbol):
+    """EMA20 > EMA50, pullback < 2%, 25 < RSI < 60."""
+    df = get_date(simbol, "15m", "5d")
+    if df is None or len(df) < 50:
+        return False, {"motiv": "date 15m insuficiente"}
+    inchideri = df["Close"].tolist()
+    pret = inchideri[-1]
+    ema20 = calculeaza_ema(inchideri, 20)
+    ema50 = calculeaza_ema(inchideri, 50)
+    rsi = calculeaza_rsi(inchideri, 14)
+    pullback = abs(pret - ema20) / ema20
+    ok = (ema20 > ema50) and (pullback < 0.02) and (25 < rsi < 60)
+    return ok, {"pret": round(pret, 2), "ema20": round(ema20, 2),
+                "ema50": round(ema50, 2), "rsi": round(rsi, 1),
+                "pullback": round(pullback * 100, 2)}
+
+
+def verifica_5m(simbol):
+    """Candle verde, EMA9 > EMA21, 45 < RSI < 70, corp > ATR*0.3."""
+    df = get_date(simbol, "5m", "1d")
+    if df is None or len(df) < 20:
+        return False, {"motiv": "date 5m insuficiente"}
+    inchideri = df["Close"].tolist()
+    pret = inchideri[-1]
+    open_ = df["Open"].iloc[-1]
+    high = df["High"].iloc[-1]
+    low = df["Low"].iloc[-1]
+    ema9 = calculeaza_ema(inchideri, 9)
+    ema21 = calculeaza_ema(inchideri, 21)
+    rsi = calculeaza_rsi(inchideri, 14)
+    atr = calculeaza_atr(df, 14)
+    verde = pret > open_
+    corp_solid = (high - low) > atr * 0.3
+    ok = verde and (ema9 > ema21) and (45 < rsi < 70) and corp_solid
+    return ok, {"pret": round(pret, 2), "ema9": round(ema9, 2),
+                "ema21": round(ema21, 2), "rsi": round(rsi, 1),
+                "atr": round(atr, 2)}
+
+
+def analizeaza_semnal(simbol):
+    """Verifica cele 3 timeframe-uri cu short-circuit. Returneaza (bool, motiv, info)."""
+    ok1, i1 = verifica_1d(simbol)
+    if not ok1:
+        return False, "1D nu e bullish", {"1d": i1}
+    ok2, i2 = verifica_15m(simbol)
+    if not ok2:
+        return False, "15m fara pullback", {"1d": i1, "15m": i2}
+    ok3, i3 = verifica_5m(simbol)
+    if not ok3:
+        return False, "5m fara entry", {"1d": i1, "15m": i2, "5m": i3}
+    motiv = (f"1D=BULLISH(RSI={i1['rsi']:.0f}) | "
+             f"15m=PULLBACK(RSI={i2['rsi']:.0f}) | "
+             f"5m=ENTRY(RSI={i3['rsi']:.0f})")
+    return True, motiv, {"1d": i1, "15m": i2, "5m": i3}
+
+
+# ═════════════════════════════════════════════════════════════
+# PERSISTENTA
+# ═════════════════════════════════════════════════════════════
+def incarca_json(cale, implicit):
+    if os.path.exists(cale):
+        try:
+            with open(cale, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return implicit
+    return implicit
+
+
+def salveaza_json(cale, date):
+    try:
+        with open(cale, "w", encoding="utf-8") as f:
+            json.dump(date, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"❌ Eroare salvare {cale}: {e}")
+
+
+def incarca_pozitii():
+    return incarca_json(POZITII_FILE, {})
+
+
+def salveaza_pozitii(pozitii):
+    salveaza_json(POZITII_FILE, pozitii)
+
+
 def incarca_memorie():
-    if os.path.exists(MEMORIE_FILE):
-        with open(MEMORIE_FILE, "r") as f:
-            return json.load(f)
-    return {
-        "tranzactii": [],
-        "performanta": {},
-        "cooldown": {},
+    return incarca_json(MEMORIE_FILE, {
+        "tranzactii": [], "performanta": {}, "cooldown": {},
         "stats": {"total_profit": 0, "wins": 0, "losses": 0}
-    }
+    })
 
 
 def salveaza_memorie(memorie):
-    with open(MEMORIE_FILE, "w") as f:
-        json.dump(memorie, f, indent=2, default=str)
+    salveaza_json(MEMORIE_FILE, memorie)
 
 
 def log_tranzactie(memorie, simbol, tip, pret, cantitate, profit=None, motiv=None):
+    acum = datetime.now()
     memorie["tranzactii"].append({
-        "simbol": simbol,
-        "tip": tip,
-        "pret": pret,
-        "cantitate": cantitate,
-        "profit": profit,
-        "motiv": motiv,
-        "ora": datetime.now().hour,
-        "data": datetime.now().isoformat()
+        "simbol": simbol, "tip": tip, "pret": round(pret, 2),
+        "cantitate": cantitate, "profit": round(profit, 2) if profit is not None else None,
+        "motiv": motiv, "ora": acum.strftime("%H:%M:%S"),
+        "data": acum.strftime("%Y-%m-%d")
     })
-
-    if profit is not None:
-        memorie["stats"]["total_profit"] += profit
-        if profit > 0:
-            memorie["stats"]["wins"] += 1
-        else:
+    if tip == "close_long" and profit is not None:
+        if profit < 0:
+            memorie["cooldown"][simbol] = acum.isoformat()
             memorie["stats"]["losses"] += 1
-            memorie["cooldown"][simbol] = datetime.now().isoformat()
-
+        else:
+            memorie["stats"]["wins"] += 1
+        memorie["stats"]["total_profit"] += profit
         if simbol not in memorie["performanta"]:
             memorie["performanta"][simbol] = {"profit": 0, "trades": 0, "wins": 0}
         p = memorie["performanta"][simbol]
@@ -146,658 +277,399 @@ def log_tranzactie(memorie, simbol, tip, pret, cantitate, profit=None, motiv=Non
         if profit > 0:
             p["wins"] += 1
 
-    salveaza_memorie(memorie)
 
-
-def simbol_in_cooldown(simbol, memorie):
-    if simbol not in memorie.get("cooldown", {}):
+# ═════════════════════════════════════════════════════════════
+# FILTRE
+# ═════════════════════════════════════════════════════════════
+def in_cooldown(memorie, simbol):
+    """True daca simbolul e in cooldown (pierdere in ultimele COOLDOWN_ORE)."""
+    ts = memorie["cooldown"].get(simbol)
+    if not ts:
         return False
-    data_pierdere = datetime.fromisoformat(memorie["cooldown"][simbol])
-    ore_trecute = (datetime.now() - data_pierdere).total_seconds() / 3600
-    if ore_trecute < COOLDOWN_ORE:
-        return True
-    del memorie["cooldown"][simbol]
-    salveaza_memorie(memorie)
-    return False
-
-
-# ═══════════════════════════════════════
-# VERIFICARE EARNINGS
-# ═══════════════════════════════════════
-def are_earnings_curand(simbol):
-    global _earnings_cache, _earnings_cache_data
-    azi = datetime.now().date()
-
-    if _earnings_cache_data != azi:
-        _earnings_cache = {}
-        _earnings_cache_data = azi
-
-    if simbol in _earnings_cache:
-        return _earnings_cache[simbol]
-
-    limita = azi + timedelta(days=ZILE_BLOCARE_EARNINGS)
-    rezultat = (False, None, None)
-
     try:
-        ticker = yf.Ticker(simbol)
-        cal = ticker.calendar
-        data_earnings = None
-        if isinstance(cal, dict):
-            ed = cal.get("Earnings Date")
-            if ed:
-                data_earnings = ed[0] if isinstance(ed, list) else ed
-        if data_earnings is not None:
-            if hasattr(data_earnings, "date"):
-                data_earnings = data_earnings.date()
-            if azi <= data_earnings <= limita:
-                rezultat = (True, str(data_earnings), "yfinance")
+        moment = datetime.fromisoformat(ts)
     except Exception:
-        pass
-
-    if not rezultat[0] and simbol in EARNINGS_MANUAL:
-        try:
-            data_man = datetime.strptime(EARNINGS_MANUAL[simbol], "%Y-%m-%d").date()
-            if azi <= data_man <= limita:
-                rezultat = (True, str(data_man), "manual")
-        except Exception:
-            pass
-
-    _earnings_cache[simbol] = rezultat
-    return rezultat
-
-
-# ═══════════════════════════════════════
-# INDICATORI
-# ═══════════════════════════════════════
-def calculeaza_ema(preturi, perioada):
-    return pd.Series(preturi).ewm(span=perioada, adjust=False).mean().iloc[-1]
-
-
-def calculeaza_rsi(preturi, perioada=14):
-    prices = pd.Series(preturi)
-    delta = prices.diff()
-    castig = delta.where(delta > 0, 0.0)
-    pierdere = -delta.where(delta < 0, 0.0)
-    avg_c = castig.rolling(window=perioada).mean().iloc[-1]
-    avg_p = pierdere.rolling(window=perioada).mean().iloc[-1]
-    if avg_p == 0:
-        return 100
-    rs = avg_c / avg_p
-    return 100 - (100 / (1 + rs))
-
-
-def calculeaza_atr(df, perioada=14):
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"].shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - close).abs(),
-        (low - close).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(perioada).mean().iloc[-1]
-
-
-def get_date(simbol, interval, period):
-    df = yf.download(simbol, period=period, interval=interval, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df
-
-
-# ═══════════════════════════════════════
-# CACHE GRAFICE (pentru dashboard)
-# ═══════════════════════════════════════
-def salveaza_grafice_cache():
-    cache = {"_updated": datetime.now().isoformat(), "actiuni": {}}
-    for simbol in ACTIUNI:
-        try:
-            df = get_date(simbol, interval="5m", period="2d")
-            if df.empty:
-                continue
-            df = df.tail(80)
-            close = df["Close"].tolist()
-            ema9 = pd.Series(close).ewm(span=9, adjust=False).mean().tolist()
-            ema21 = pd.Series(close).ewm(span=21, adjust=False).mean().tolist()
-
-            s = pd.Series(close)
-            delta = s.diff()
-            castig = delta.where(delta > 0, 0.0)
-            pierdere = -delta.where(delta < 0, 0.0)
-            avg_c = castig.rolling(14).mean()
-            avg_p = pierdere.rolling(14).mean()
-            rs = avg_c / avg_p.replace(0, 0.0001)
-            rsi_v = (100 - (100 / (1 + rs))).fillna(50).tolist()
-
-            st, change = "?", 0
-            df1d = get_date(simbol, interval="1d", period="200d")
-            if not df1d.empty and len(df1d) >= 200:
-                p1d = df1d["Close"].tolist()
-                pc = p1d[-1]
-                e50 = pd.Series(p1d).ewm(span=50, adjust=False).mean().iloc[-1]
-                e200 = pd.Series(p1d).ewm(span=200, adjust=False).mean().iloc[-1]
-                if pc > e50 > e200:
-                    st = "🟢 1D bullish"
-                elif pc > e50:
-                    st = "🟠 partial"
-                else:
-                    st = "⏳ nu"
-                if len(p1d) >= 2:
-                    change = (p1d[-1] - p1d[-2]) / p1d[-2] * 100
-
-            cache["actiuni"][simbol] = {
-                "dates": df.index.strftime("%Y-%m-%d %H:%M").tolist(),
-                "open": df["Open"].tolist(), "high": df["High"].tolist(),
-                "low": df["Low"].tolist(), "close": close,
-                "ema9": ema9, "ema21": ema21, "rsi": rsi_v,
-                "status_1d": st, "change": change
-            }
-        except Exception as e:
-            print(f"  Cache grafic {simbol}: {e}")
-
-    try:
-        with open(GRAFICE_CACHE_FILE, "w") as f:
-            json.dump(cache, f)
-    except Exception as e:
-        print(f"  Eroare salvare cache grafice: {e}")
-
-
-# ═══════════════════════════════════════
-# ANALIZA 3 TIMEFRAME
-# ═══════════════════════════════════════
-def analiza_1d(simbol):
-    try:
-        df = get_date(simbol, interval="1d", period="200d")
-        if df.empty or len(df) < 200:
-            return False, {}
-
-        preturi = df["Close"].tolist()
-        pret_curent = preturi[-1]
-        ema50 = calculeaza_ema(preturi, 50)
-        ema200 = calculeaza_ema(preturi, 200)
-        rsi = calculeaza_rsi(preturi, 14)
-
-        trend_bullish = pret_curent > ema50 > ema200
-        rsi_ok = 40 < rsi < 75
-
-        info = {
-            "pret_1d": pret_curent,
-            "ema50_1d": ema50,
-            "ema200_1d": ema200,
-            "rsi_1d": rsi,
-            "trend_1d": "bullish" if trend_bullish else "bearish"
-        }
-        return trend_bullish and rsi_ok, info
-    except Exception as e:
-        return False, {}
-
-
-def analiza_15m(simbol):
-    try:
-        df = get_date(simbol, interval="15m", period="5d")
-        if df.empty or len(df) < 50:
-            return False, {}
-
-        preturi = df["Close"].tolist()
-        pret_curent = preturi[-1]
-        ema20 = calculeaza_ema(preturi, 20)
-        ema50 = calculeaza_ema(preturi, 50)
-        rsi = calculeaza_rsi(preturi, 14)
-
-        trend_bullish = ema20 > ema50
-        distanta_ema20 = abs(pret_curent - ema20) / ema20
-        pullback = distanta_ema20 < PULLBACK_MAX_15M
-        rsi_pullback = RSI_15M_MIN < rsi < RSI_15M_MAX
-
-        info = {
-            "pret_15m": pret_curent,
-            "ema20_15m": ema20,
-            "ema50_15m": ema50,
-            "rsi_15m": rsi,
-            "distanta_ema": distanta_ema20,
-            "pullback": pullback
-        }
-        return trend_bullish and pullback and rsi_pullback, info
-    except Exception as e:
-        return False, {}
-
-
-def analiza_5m(simbol):
-    try:
-        df = get_date(simbol, interval="5m", period="1d")
-        if df.empty or len(df) < 20:
-            return False, {}, 0
-
-        preturi = df["Close"].tolist()
-        high = df["High"].tolist()
-        low = df["Low"].tolist()
-        open_p = df["Open"].tolist()
-        pret_curent = preturi[-1]
-
-        ema9 = calculeaza_ema(preturi, 9)
-        ema21 = calculeaza_ema(preturi, 21)
-        rsi = calculeaza_rsi(preturi, 14)
-        atr = calculeaza_atr(df, 14)
-
-        candle_verde = preturi[-1] > open_p[-1]
-        trend_scurt = ema9 > ema21
-        rsi_in_crestere = rsi > 45 and rsi < 70
-        rang_candle = high[-1] - low[-1]
-        candle_solid = rang_candle > atr * 0.3
-
-        info = {
-            "pret_5m": pret_curent,
-            "ema9_5m": ema9,
-            "ema21_5m": ema21,
-            "rsi_5m": rsi,
-            "atr_5m": atr,
-            "candle_verde": candle_verde,
-            "trend_scurt": trend_scurt
-        }
-
-        confirmat = candle_verde and trend_scurt and rsi_in_crestere and candle_solid
-        return confirmat, info, atr
-    except Exception as e:
-        return False, {}, 0
-
-
-# ═══════════════════════════════════════
-# SEMNAL COMBINAT
-# ═══════════════════════════════════════
-def analizeaza_semnal(simbol, memorie):
-    try:
-        if simbol_in_cooldown(simbol, memorie):
-            return None, {}
-
-        earnings_curand, data_e, sursa = are_earnings_curand(simbol)
-        if earnings_curand:
-            return None, {"step": "earnings", "data_earnings": data_e, "sursa_earnings": sursa}
-
-        ok_1d, info_1d = analiza_1d(simbol)
-        if not ok_1d:
-            return None, {"step": "1d_fail", **info_1d}
-
-        ok_15m, info_15m = analiza_15m(simbol)
-        if not ok_15m:
-            return None, {"step": "15m_fail", **info_1d, **info_15m}
-
-        ok_5m, info_5m, atr = analiza_5m(simbol)
-        if not ok_5m:
-            return None, {"step": "5m_fail", **info_1d, **info_15m, **info_5m}
-
-        info = {**info_1d, **info_15m, **info_5m, "atr": atr,
-                "step": "all_ok",
-                "pret": info_5m["pret_5m"]}
-
-        motiv = (
-            f"1D=BULLISH(RSI={info_1d['rsi_1d']:.0f}) | "
-            f"15m=PULLBACK(RSI={info_15m['rsi_15m']:.0f}) | "
-            f"5m=ENTRY(RSI={info_5m['rsi_5m']:.0f})"
-        )
-        info["motiv_intrare"] = motiv
-
-        return "long", info
-
-    except Exception as e:
-        print(f"  Eroare analiza {simbol}: {e}")
-        return None, {}
-
-
-# ═══════════════════════════════════════
-# EXIT
-# ═══════════════════════════════════════
-def verifica_exit(simbol, pret_intrare, pret_max, trailing_activ):
-    try:
-        df = get_date(simbol, interval="5m", period="1d")
-        if df.empty:
-            return False, None, pret_max, trailing_activ
-
-        preturi = df["Close"].tolist()
-        pret_curent = preturi[-1]
-        rsi = calculeaza_rsi(preturi, 14)
-        ema9 = calculeaza_ema(preturi, 9)
-        ema21 = calculeaza_ema(preturi, 21)
-        variatie = (pret_curent - pret_intrare) / pret_intrare
-
-        pret_max = max(pret_max, pret_curent)
-
-        if variatie >= TRAILING_ACTIV_PCT and not trailing_activ:
-            trailing_activ = True
-            print(f"  🎯 {simbol} — Trailing activat la {variatie:.2%}")
-
-        if trailing_activ:
-            drawdown = (pret_max - pret_curent) / pret_max
-            if drawdown >= TRAILING_STOP_PCT:
-                return True, f"TRAILING STOP (profit={variatie:.2%})", pret_max, trailing_activ
-
-        if variatie <= -STOP_LOSS_PCT:
-            return True, f"STOP LOSS ({variatie:.2%})", pret_max, trailing_activ
-
-        if variatie >= TAKE_PROFIT_PCT:
-            return True, f"TAKE PROFIT ({variatie:.2%})", pret_max, trailing_activ
-
-        if ema9 < ema21 and variatie > 0:
-            return True, f"EMA9<EMA21 ({variatie:.2%})", pret_max, trailing_activ
-
-        if rsi > 78:
-            return True, f"RSI OVERBOUGHT ({rsi:.1f})", pret_max, trailing_activ
-
-        return False, None, pret_max, trailing_activ
-
-    except Exception as e:
-        return False, None, pret_max, trailing_activ
-
-
-# ═══════════════════════════════════════
-# CANTITATE
-# ═══════════════════════════════════════
-def calculeaza_cantitate(pret, atr):
-    try:
-        account = api.get_account()
-        portofoliu = float(account.portfolio_value)
-    except:
-        portofoliu = 100000
-
-    risc_max = portofoliu * MAX_RISC_PORTOFOLIU
-    stop_loss_dinamic = max(STOP_LOSS_PCT, atr / pret * 1.5)
-    cantitate_risc = int(risc_max / (pret * stop_loss_dinamic))
-    cantitate_size = int(MAX_TRADE_SIZE_USD / pret)
-    cantitate = min(cantitate_risc, cantitate_size)
-    return max(1, cantitate)
-
-
-# ═══════════════════════════════════════
-# TRANZACTIONARE
-# ═══════════════════════════════════════
-def deschide_pozitie(simbol, pret, cantitate, motiv, memorie):
-    global trades_azi
-    try:
-        api.submit_order(
-            symbol=simbol, qty=cantitate,
-            side="buy", type="market", time_in_force="gtc"
-        )
-        print(f"  ✅ LONG {cantitate}x {simbol} @ ${pret:.2f}")
-        print(f"     {motiv}")
-        print(f"     SL={STOP_LOSS_PCT:.2%} | TP={TAKE_PROFIT_PCT:.2%}")
-
-        pozitii_deschise[simbol] = {
-            "pret_intrare": pret,
-            "cantitate": cantitate,
-            "pret_max": pret,
-            "trailing_activ": False
-        }
-        trades_azi += 1
-        salveaza_pozitii_active()
-        log_tranzactie(memorie, simbol, "open_long", pret, cantitate)
-
-    except Exception as e:
-        print(f"  Eroare deschidere {simbol}: {e}")
-
-
-def inchide_pozitie(simbol, motiv, memorie):
-    if simbol not in pozitii_deschise:
-        return
-    pozitie = pozitii_deschise[simbol]
-    try:
-        df = get_date(simbol, interval="5m", period="1d")
-        pret_curent = df["Close"].iloc[-1]
-
-        api.submit_order(
-            symbol=simbol, qty=pozitie["cantitate"],
-            side="sell", type="market", time_in_force="gtc"
-        )
-        profit = (pret_curent - pozitie["pret_intrare"]) * pozitie["cantitate"]
-
-        emoji = "🟢" if profit > 0 else "🔴"
-        print(f"  {emoji} INCHIS {simbol} | {motiv} | Profit: ${profit:.2f}")
-        log_tranzactie(
-            memorie, simbol, "close_long",
-            pret_curent, pozitie["cantitate"], profit, motiv
-        )
-        del pozitii_deschise[simbol]
-        salveaza_pozitii_active()
-
-    except Exception as e:
-        print(f"  Eroare inchidere {simbol}: {e}")
-
-
-def inchide_toate_pozitiile(memorie):
-    if not pozitii_deschise:
         return False
-    print(f"\n🔔 INCHIDERE AUTOMATA — aproape de inchiderea bursei")
-    print(f"📂 Inchidem {len(pozitii_deschise)} pozitii...")
-    for simbol in list(pozitii_deschise.keys()):
-        inchide_pozitie(simbol, "END OF DAY", memorie)
+    if datetime.now() - moment > timedelta(hours=COOLDOWN_ORE):
+        del memorie["cooldown"][simbol]
+        return False
     return True
 
 
-# ═══════════════════════════════════════
-# EXPORT CSV
-# ═══════════════════════════════════════
-def export_csv_automat(memorie, zi=None):
-    tranzactii = memorie["tranzactii"]
-    if zi is None:
-        zi = date.today().isoformat()
+_earnings_cache = {"data": None, "valori": {}}
 
-    inchideri = [
-        t for t in tranzactii
-        if t["tip"] == "close_long"
-        and t.get("profit") is not None
-        and t["data"].startswith(zi)
-    ]
 
+def are_earnings_curand(simbol):
+    """True daca simbolul are earnings in <= EARNINGS_BLOCARE_ZILE. Cache pe zi."""
+    azi = datetime.now().strftime("%Y-%m-%d")
+    if _earnings_cache["data"] != azi:
+        _earnings_cache["data"] = azi
+        _earnings_cache["valori"] = {}
+    if simbol in _earnings_cache["valori"]:
+        return _earnings_cache["valori"][simbol]
+
+    rezultat = False
+    data_earnings = None
+    # Doar din .env (evitam yfinance complet pentru a nu lovi rate-limit)
+    if simbol in EARNINGS_MANUAL:
+        try:
+            data_earnings = datetime.strptime(EARNINGS_MANUAL[simbol], "%Y-%m-%d").date()
+        except Exception:
+            data_earnings = None
+
+    if data_earnings is not None:
+        try:
+            if hasattr(data_earnings, "date"):
+                data_earnings = data_earnings.date()
+            zile = (data_earnings - datetime.now().date()).days
+            if 0 <= zile <= EARNINGS_BLOCARE_ZILE:
+                rezultat = True
+        except Exception:
+            rezultat = False
+
+    _earnings_cache["valori"][simbol] = rezultat
+    return rezultat
+
+
+# ═════════════════════════════════════════════════════════════
+# DIMENSIONARE POZITIE
+# ═════════════════════════════════════════════════════════════
+def get_portofoliu():
+    try:
+        acc = api.get_account()
+        return float(acc.portfolio_value)
+    except Exception:
+        return 100000.0
+
+
+def calculeaza_cantitate(pret, atr):
+    portofoliu = get_portofoliu()
+    risc_max = portofoliu * RISC_PORTOFOLIU_PCT
+    stop_loss_dinamic = max(STOP_LOSS_MIN_PCT, atr / pret * 1.5)
+    cantitate_risc = int(risc_max / (pret * stop_loss_dinamic))
+    cantitate_size = int(MAX_TRADE_SIZE_USD / pret)
+    return max(1, min(cantitate_risc, cantitate_size))
+
+
+# ═════════════════════════════════════════════════════════════
+# ORDINE
+# ═════════════════════════════════════════════════════════════
+def plaseaza_ordin(simbol, cantitate, side):
+    try:
+        api.submit_order(symbol=simbol, qty=cantitate, side=side,
+                         type="market", time_in_force="gtc")
+        return True
+    except Exception as e:
+        print(f"❌ Ordin {side} {simbol} esuat: {e}")
+        return False
+
+
+# ═════════════════════════════════════════════════════════════
+# IESIRE — 5 conditii, prima adevarata castiga
+# ═════════════════════════════════════════════════════════════
+def verifica_iesire(simbol, poz, pret_curent, ema9, ema21, rsi_5m):
+    """Returneaza (trebuie_iesire, motiv). Actualizeaza pret_max in poz."""
+    pret_intrare = poz["pret_intrare"]
+    pl_pct = (pret_curent - pret_intrare) / pret_intrare
+
+    # Actualizeaza maximul
+    if pret_curent > poz.get("pret_max", pret_intrare):
+        poz["pret_max"] = pret_curent
+
+    # 1. Trailing stop (activ la +1.5%, iesire daca scade 1% de la max)
+    if pl_pct >= TRAILING_ACTIVARE_PCT:
+        poz["trailing_activ"] = True
+    if poz.get("trailing_activ"):
+        scadere_de_la_max = (poz["pret_max"] - pret_curent) / poz["pret_max"]
+        if scadere_de_la_max >= TRAILING_DISTANTA_PCT:
+            return True, f"TRAILING STOP (-{scadere_de_la_max*100:.1f}% de la max)"
+
+    # 2. Stop loss -1.5%
+    if pl_pct <= -STOP_LOSS_PCT:
+        return True, f"STOP LOSS ({pl_pct*100:.1f}%)"
+
+    # 3. Take profit +4%
+    if pl_pct >= TAKE_PROFIT_PCT:
+        return True, f"TAKE PROFIT (+{pl_pct*100:.1f}%)"
+
+    # 4. EMA9 < EMA21, doar daca pe profit
+    if ema9 < ema21 and pl_pct > 0:
+        return True, f"EMA CROSS (EMA9<EMA21, +{pl_pct*100:.1f}%)"
+
+    # 5. RSI(5m) > 78
+    if rsi_5m > RSI_5M_EXIT:
+        return True, f"RSI OVERBOUGHT ({rsi_5m:.1f})"
+
+    return False, None
+
+
+# ═════════════════════════════════════════════════════════════
+# RAPORT CSV ZILNIC
+# ═════════════════════════════════════════════════════════════
+def genereaza_raport_csv(memorie, zi):
+    import csv
+    cale = os.path.join(FOLDER, f"multitf_trades_{zi}.csv")
+    inchideri = [t for t in memorie["tranzactii"]
+                 if t["data"] == zi and t["tip"] == "close_long"]
     if not inchideri:
         print(f"📊 Nicio inchidere pentru raport ({zi})")
         return
-
-    CSV_FILE = f"/home/liviu_anton/trading/multitf_trades_{zi}.csv"
-    campuri = [
-        "data_iesire", "simbol", "cantitate",
-        "pret_intrare", "pret_iesire",
-        "profit_usd", "profit_pct",
-        "motiv_exit", "rezultat"
-    ]
-
-    rows = []
-    for t in inchideri:
-        simbol = t["simbol"]
-        pret_intrare = 0
-        for d in reversed(tranzactii):
-            if d["simbol"] == simbol and d["tip"] == "open_long":
-                if d["data"] < t["data"]:
-                    pret_intrare = d["pret"]
+    with open(cale, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["data_iesire", "simbol", "cantitate", "pret_intrare",
+                    "pret_iesire", "profit_usd", "profit_pct", "motiv_exit", "rezultat"])
+        for t in inchideri:
+            # Cauta pretul de intrare: primul open_long anterior pe acelasi simbol
+            pret_intrare = None
+            idx = memorie["tranzactii"].index(t)
+            for k in range(idx - 1, -1, -1):
+                tp = memorie["tranzactii"][k]
+                if tp["simbol"] == t["simbol"] and tp["tip"] == "open_long":
+                    pret_intrare = tp["pret"]
                     break
-
-        profit = t["profit"]
-        profit_pct = (profit / (pret_intrare * t["cantitate"]) * 100) if pret_intrare > 0 else 0
-
-        rows.append({
-            "data_iesire": t["data"],
-            "simbol": simbol,
-            "cantitate": t["cantitate"],
-            "pret_intrare": round(pret_intrare, 4),
-            "pret_iesire": round(t["pret"], 4),
-            "profit_usd": round(profit, 2),
-            "profit_pct": round(profit_pct, 2),
-            "motiv_exit": t.get("motiv", ""),
-            "rezultat": "WIN" if profit > 0 else "LOSS"
-        })
-
-    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=campuri)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    wins = [r for r in rows if r["rezultat"] == "WIN"]
-    profit_total = sum(r["profit_usd"] for r in rows)
-    win_rate = len(wins) / len(rows) if rows else 0
-
-    print(f"\n📊 RAPORT {zi}: {len(rows)} trades | "
-          f"Win rate={win_rate:.1%} | Profit=${profit_total:.2f}")
+            profit = t.get("profit", 0) or 0
+            profit_pct = 0
+            if pret_intrare:
+                profit_pct = (t["pret"] - pret_intrare) / pret_intrare * 100
+            rezultat = "WIN" if profit >= 0 else "LOSS"
+            w.writerow([t["data"] + "T" + t["ora"], t["simbol"], t["cantitate"],
+                        pret_intrare, t["pret"], round(profit, 2),
+                        round(profit_pct, 2), t.get("motiv", ""), rezultat])
+    print(f"📄 Raport generat: {cale} ({len(inchideri)} inchideri)")
 
 
-# ═══════════════════════════════════════
-# DISPLAY
-# ═══════════════════════════════════════
-def afiseaza_stats(memorie):
-    stats = memorie["stats"]
-    total = stats["wins"] + stats["losses"]
-    rata = stats["wins"] / total if total > 0 else 0
-    print(f"\n📊 STATS: Profit=${stats['total_profit']:.2f} | "
-          f"Win rate={rata:.1%} | Trades={total}")
-
-
-def afiseaza_pozitii():
-    if not pozitii_deschise:
-        return
-    print("\n📂 POZITII:")
-    for simbol, poz in pozitii_deschise.items():
+# ═════════════════════════════════════════════════════════════
+# CACHE GRAFICE (pentru dashboard, ca sa nu faca cereri yfinance)
+# ═════════════════════════════════════════════════════════════
+def actualizeaza_cache_grafice(pozitii):
+    cache = {}
+    for simbol in ACTIUNI:
         try:
-            df = get_date(simbol, interval="5m", period="1d")
-            pret_curent = df["Close"].iloc[-1]
-            variatie = (pret_curent - poz["pret_intrare"]) / poz["pret_intrare"]
-        except:
-            variatie = 0
-        emoji = "🟢" if variatie > 0 else "🔴"
-        trailing = "🎯" if poz.get("trailing_activ") else ""
-        print(f"  {emoji} {simbol} | ${poz['pret_intrare']:.2f} | P&L={variatie:.2%} {trailing}")
+            df = get_date(simbol, "5m", "1d")
+            if df is None or len(df) < 21:
+                continue
+            df = df.tail(80)
+            inchideri = df["Close"].tolist()
+            ema9_serie = pd.Series(inchideri).ewm(span=9, adjust=False).mean().tolist()
+            ema21_serie = pd.Series(inchideri).ewm(span=21, adjust=False).mean().tolist()
+            rsi_serie = []
+            s = pd.Series(inchideri)
+            delta = s.diff()
+            castig = delta.where(delta > 0, 0.0).rolling(14).mean()
+            pierdere = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
+            rs = castig / pierdere.replace(0, 0.0001)
+            rsi_serie = (100 - (100 / (1 + rs))).fillna(50).tolist()
+
+            # Status 1D
+            ok1, i1 = verifica_1d(simbol)
+            if ok1:
+                status_1d = "🟢 1D bullish"
+            else:
+                status_1d = "⏳ 1D nu"
+
+            # Variatie zilnica
+            df_zi = get_date(simbol, "1d", "5d")
+            var_zi = 0
+            if df_zi is not None and len(df_zi) >= 2:
+                c = df_zi["Close"].tolist()
+                var_zi = (c[-1] - c[-2]) / c[-2] * 100
+
+            cache[simbol] = {
+                "dates": [str(x) for x in df.index.tolist()],
+                "open": df["Open"].tolist(), "high": df["High"].tolist(),
+                "low": df["Low"].tolist(), "close": inchideri,
+                "ema9": ema9_serie, "ema21": ema21_serie, "rsi": rsi_serie,
+                "status_1d": status_1d, "var_zi": round(var_zi, 2)
+            }
+        except Exception:
+            continue
+    salveaza_json(GRAFICE_FILE, cache)
 
 
-# ═══════════════════════════════════════
-# AGENT PRINCIPAL
-# ═══════════════════════════════════════
-def agent():
-    global trades_azi, data_curenta, raport_generat_azi, inchidere_facuta_azi, pozitii_deschise
-
-    print("🤖 MULTI-TIMEFRAME OPTIMIZAT (R1 + A + stop intrari 2h)")
-    print(f"📋 Actiuni: {', '.join(ACTIUNI)}")
-    print(f"💰 Max trade: ${MAX_TRADE_SIZE_USD} | Max pozitii: {MAX_POZITII}")
-    print(f"🛑 SL={STOP_LOSS_PCT:.2%} | TP={TAKE_PROFIT_PCT:.2%} | Trailing={TRAILING_STOP_PCT:.2%} (activ la {TRAILING_ACTIV_PCT:.1%})")
-    print(f"🎯 15m: pullback<{PULLBACK_MAX_15M:.1%} | RSI {RSI_15M_MIN}-{RSI_15M_MAX}")
-    print(f"📅 Blocare earnings: {ZILE_BLOCARE_EARNINGS} zi | Manual: {len(EARNINGS_MANUAL)} simboluri")
-    print(f"🔔 Inchidere: {MINUTE_INAINTE_CLOSE} min inainte | Stop intrari: {ORE_STOP_INTRARI}h inainte")
-    print(f"⏱️  Scanare la fiecare {INTERVAL_SCANARE}s | Cache grafice la 5 cicluri")
+# ═════════════════════════════════════════════════════════════
+# BUCLA PRINCIPALA
+# ═════════════════════════════════════════════════════════════
+def afiseaza_config():
+    print("=" * 60)
+    print("🤖 AGENT MULTI-TIMEFRAME (1D + 15m + 5m) — LIVE")
+    print("=" * 60)
+    print(f"🛑 SL={STOP_LOSS_PCT*100:.2f}% | TP={TAKE_PROFIT_PCT*100:.2f}% | "
+          f"Trailing={TRAILING_DISTANTA_PCT*100:.1f}% (activ la {TRAILING_ACTIVARE_PCT*100:.1f}%)")
+    print(f"🎯 15m: pullback<2.0% | RSI 25-60")
+    print(f"📅 Blocare earnings: {EARNINGS_BLOCARE_ZILE} zi | Manual: {len(EARNINGS_MANUAL)} simboluri")
+    print(f"🔔 Inchidere: {INCHIDERE_MIN_INAINTE} min inainte | Stop intrari: {STOP_INTRARI_ORE_INAINTE}h inainte")
+    print(f"⏱️  Scanare la fiecare {SCAN_INTERVAL_SEC}s | Cache grafice la {CACHE_GRAFICE_CICLURI} cicluri")
+    print(f"📋 {len(ACTIUNI)} actiuni: {', '.join(ACTIUNI[:10])}{'...' if len(ACTIUNI) > 10 else ''}")
     print("-" * 60)
 
+
+def ruleaza():
+    afiseaza_config()
+    pozitii = incarca_pozitii()
     memorie = incarca_memorie()
-    pozitii_deschise = incarca_pozitii_active()
+
     ciclu = 0
+    zi_curenta = datetime.now().strftime("%Y-%m-%d")
+    trades_azi = 0
+    raport_facut = False
+    inchidere_facuta = False
 
     while True:
         try:
-            if datetime.now().date() != data_curenta:
-                data_curenta = datetime.now().date()
+            ciclu += 1
+            acum = datetime.now()
+            zi = acum.strftime("%Y-%m-%d")
+
+            # Detectare zi noua — reset contoare
+            if zi != zi_curenta:
+                zi_curenta = zi
                 trades_azi = 0
-                raport_generat_azi = False
-                inchidere_facuta_azi = False
-                print("🔄 Zi noua")
+                raport_facut = False
+                inchidere_facuta = False
+                print(f"\n🌅 Zi noua: {zi} — contoare resetate")
 
-            print(f"\n⏰ {datetime.now().strftime('%H:%M:%S')} | "
-                  f"Ciclu #{ciclu} | "
-                  f"Trades: {trades_azi}/{MAX_TRADES_PER_DAY} | "
-                  f"Pozitii: {len(pozitii_deschise)}/{MAX_POZITII}")
+            # Status bursa
+            try:
+                clock = api.get_clock()
+                bursa_deschisa = clock.is_open
+                next_close = clock.next_close
+                next_open = clock.next_open
+            except Exception as e:
+                print(f"❌ Eroare clock Alpaca: {e}")
+                time.sleep(SCAN_INTERVAL_SEC)
+                continue
 
-            clock = api.get_clock()
-            secunde_pana_close = (clock.next_close - clock.timestamp).total_seconds()
-            ore_pana_close = secunde_pana_close / 3600
+            print(f"⏰ {acum.strftime('%H:%M:%S')} | Ciclu #{ciclu} | "
+                  f"Trades: {trades_azi}/{MAX_TRADES_PER_DAY} | Pozitii: {len(pozitii)}/{MAX_POZITII}")
 
-            # INCHIDERE + RAPORT cu X min inainte de inchiderea reala
-            if clock.is_open and not inchidere_facuta_azi:
-                if secunde_pana_close <= MINUTE_INAINTE_CLOSE * 60:
-                    print(f"\n🔔 Mai sunt {secunde_pana_close/60:.0f} min pana la inchidere")
-                    if pozitii_deschise:
-                        inchide_toate_pozitiile(memorie)
-                    inchidere_facuta_azi = True
-                    if not raport_generat_azi:
-                        export_csv_automat(memorie, zi=data_curenta.isoformat())
-                        raport_generat_azi = True
-
-            if not clock.is_open:
-                if not raport_generat_azi:
-                    export_csv_automat(memorie, zi=data_curenta.isoformat())
-                    raport_generat_azi = True
-                if ciclu % 10 == 0:
-                    salveaza_grafice_cache()
-                print(f"❌ Bursa inchisa. Se deschide: {clock.next_open}")
-                ciclu += 1
+            # ─── BURSA INCHISA ───
+            if not bursa_deschisa:
+                if not raport_facut:
+                    genereaza_raport_csv(memorie, zi)
+                    salveaza_memorie(memorie)
+                    raport_facut = True
+                if ciclu % CACHE_GRAFICE_CICLURI_INCHIS == 0:
+                    actualizeaza_cache_grafice(pozitii)
+                try:
+                    print(f"❌ Bursa inchisa. Se deschide: {next_open}")
+                except Exception:
+                    print("❌ Bursa inchisa.")
                 time.sleep(300)
                 continue
 
-            if inchidere_facuta_azi:
-                print("🌙 Inchidere automata facuta. Astept inchiderea bursei...")
-                time.sleep(60)
-                continue
+            # ─── BURSA DESCHISA ───
+            # Minute pana la inchidere
+            try:
+                min_pana_inchidere = (next_close - acum.astimezone(next_close.tzinfo)).total_seconds() / 60
+            except Exception:
+                min_pana_inchidere = 999
 
-            # EXIT — verifica pozitiile existente (mereu, indiferent de ora)
-            for simbol in list(pozitii_deschise.keys()):
-                poz = pozitii_deschise[simbol]
-                exit_acum, motiv, pret_max_nou, trailing_nou = verifica_exit(
-                    simbol, poz["pret_intrare"], poz["pret_max"],
-                    poz.get("trailing_activ", False)
-                )
-                pozitii_deschise[simbol]["pret_max"] = pret_max_nou
-                pozitii_deschise[simbol]["trailing_activ"] = trailing_nou
-                if exit_acum:
-                    inchide_pozitie(simbol, motiv, memorie)
-                else:
-                    salveaza_pozitii_active()
+            # Inchidere fortata cu 15 min inainte
+            if min_pana_inchidere <= INCHIDERE_MIN_INAINTE and not inchidere_facuta and pozitii:
+                print(f"🔔 END OF DAY — inchid toate pozitiile ({len(pozitii)})")
+                for simbol in list(pozitii.keys()):
+                    poz = pozitii[simbol]
+                    try:
+                        df5 = get_date(simbol, "5m", "1d")
+                        pret = df5["Close"].iloc[-1] if df5 is not None else poz["pret_intrare"]
+                    except Exception:
+                        pret = poz["pret_intrare"]
+                    if plaseaza_ordin(simbol, poz["cantitate"], "sell"):
+                        profit = (pret - poz["pret_intrare"]) * poz["cantitate"]
+                        log_tranzactie(memorie, simbol, "close_long", pret,
+                                       poz["cantitate"], profit, "END OF DAY")
+                        emoji = "🟢" if profit >= 0 else "🔴"
+                        print(f"  {emoji} {simbol} inchis EOD: ${profit:.2f}")
+                        del pozitii[simbol]
+                salveaza_pozitii(pozitii)
+                salveaza_memorie(memorie)
+                genereaza_raport_csv(memorie, zi)
+                raport_facut = True
+                inchidere_facuta = True
 
-            # CAUTA INTRARI — blocate in ultimele ORE_STOP_INTRARI ore
-            locuri_libere = MAX_POZITII - len(pozitii_deschise)
-
-            if ore_pana_close < ORE_STOP_INTRARI:
-                print(f"  ⏰ Mai sunt {ore_pana_close:.1f}h pana la inchidere — nu mai deschid pozitii noi")
-            elif locuri_libere > 0 and trades_azi < MAX_TRADES_PER_DAY:
-                print(f"\n🔍 Scanez {len(ACTIUNI)} actiuni")
-
-                for simbol in ACTIUNI:
-                    if simbol in pozitii_deschise:
+            # ─── VERIFICARE IESIRI (pentru pozitiile deschise) ───
+            for simbol in list(pozitii.keys()):
+                poz = pozitii[simbol]
+                try:
+                    df5 = get_date(simbol, "5m", "1d")
+                    if df5 is None or len(df5) < 21:
                         continue
-
-                    semnal, info = analizeaza_semnal(simbol, memorie)
-                    step = info.get("step", "?")
-
-                    if step == "all_ok":
-                        print(f"  ⭐ {simbol}: TOATE TF aliniate! {info.get('motiv_intrare', '')}")
-                    elif step == "earnings":
-                        print(f"  📅 {simbol}: BLOCAT — earnings pe {info.get('data_earnings')} ({info.get('sursa_earnings')})")
-                    elif step == "5m_fail":
-                        print(f"  🟡 {simbol}: 1D+15m OK, asteapt 5m entry")
-                    elif step == "15m_fail":
-                        print(f"  🟠 {simbol}: 1D OK, asteapt pullback 15m")
+                    inchideri = df5["Close"].tolist()
+                    pret = inchideri[-1]
+                    ema9 = calculeaza_ema(inchideri, 9)
+                    ema21 = calculeaza_ema(inchideri, 21)
+                    rsi_5m = calculeaza_rsi(inchideri, 14)
+                    iesire, motiv = verifica_iesire(simbol, poz, pret, ema9, ema21, rsi_5m)
+                    if iesire:
+                        if plaseaza_ordin(simbol, poz["cantitate"], "sell"):
+                            profit = (pret - poz["pret_intrare"]) * poz["cantitate"]
+                            log_tranzactie(memorie, simbol, "close_long", pret,
+                                           poz["cantitate"], profit, motiv)
+                            emoji = "🟢" if profit >= 0 else "🔴"
+                            print(f"  {emoji} IESIRE {simbol}: {motiv} | ${profit:.2f}")
+                            del pozitii[simbol]
+                            salveaza_pozitii(pozitii)
+                            salveaza_memorie(memorie)
                     else:
-                        print(f"  ⏳ {simbol}: trend 1D nu e bullish")
+                        salveaza_pozitii(pozitii)  # pentru pret_max/trailing actualizat
+                except Exception as e:
+                    print(f"  ❌ Eroare iesire {simbol}: {e}")
 
-                    if semnal == "long" and trades_azi < MAX_TRADES_PER_DAY:
-                        atr = info.get("atr", info["pret"] * 0.01)
-                        cantitate = calculeaza_cantitate(info["pret"], atr)
-                        if cantitate >= 1:
-                            deschide_pozitie(
-                                simbol, info["pret"], cantitate,
-                                info.get("motiv_intrare", ""), memorie
-                            )
+            # ─── CAUTARE INTRARI ───
+            stop_intrari = min_pana_inchidere <= STOP_INTRARI_ORE_INAINTE * 60
+            poate_intra = (len(pozitii) < MAX_POZITII
+                           and trades_azi < MAX_TRADES_PER_DAY
+                           and not stop_intrari)
 
-            afiseaza_pozitii()
-            afiseaza_stats(memorie)
+            if poate_intra:
+                for simbol in ACTIUNI:
+                    if len(pozitii) >= MAX_POZITII or trades_azi >= MAX_TRADES_PER_DAY:
+                        break
+                    if simbol in pozitii:
+                        continue
+                    if in_cooldown(memorie, simbol):
+                        print(f"  ⏳ {simbol}: cooldown activ")
+                        continue
+                    if are_earnings_curand(simbol):
+                        print(f"  📅 {simbol}: BLOCAT — earnings curand")
+                        continue
+                    try:
+                        semnal, motiv, info = analizeaza_semnal(simbol)
+                        if semnal:
+                            df5 = get_date(simbol, "5m", "1d")
+                            pret = df5["Close"].iloc[-1]
+                            atr = calculeaza_atr(df5, 14)
+                            cantitate = calculeaza_cantitate(pret, atr)
+                            print(f"  ⭐ SEMNAL {simbol}: {motiv}")
+                            if plaseaza_ordin(simbol, cantitate, "buy"):
+                                pozitii[simbol] = {
+                                    "pret_intrare": pret, "cantitate": cantitate,
+                                    "pret_max": pret, "trailing_activ": False
+                                }
+                                log_tranzactie(memorie, simbol, "open_long", pret,
+                                               cantitate, None, motiv)
+                                trades_azi += 1
+                                print(f"  ✅ INTRARE {simbol}: {cantitate} @ ${pret:.2f}")
+                                salveaza_pozitii(pozitii)
+                                salveaza_memorie(memorie)
+                        else:
+                            print(f"  ⏳ {simbol}: {motiv}")
+                    except Exception as e:
+                        print(f"  ❌ Eroare analiza {simbol}: {e}")
 
-            if ciclu % 5 == 0:
-                salveaza_grafice_cache()
+            # ─── CACHE GRAFICE ───
+            if ciclu % CACHE_GRAFICE_CICLURI == 0:
+                actualizeaza_cache_grafice(pozitii)
 
-            ciclu += 1
-            time.sleep(INTERVAL_SCANARE)
+            salveaza_memorie(memorie)
+            time.sleep(SCAN_INTERVAL_SEC)
 
         except Exception as e:
-            print(f"❌ Eroare: {e}")
-            time.sleep(60)
+            print(f"❌ EROARE in bucla principala: {e}")
+            traceback.print_exc()
+            time.sleep(SCAN_INTERVAL_SEC)
 
 
-def start():
-    clock = api.get_clock()
-    if clock.is_open:
-        print("✅ Bursa DESCHISA!")
-    else:
-        print(f"❌ Bursa INCHISA — se deschide la: {clock.next_open}")
-    agent()
-
-
-start()
+if __name__ == "__main__":
+    _redirect_log()
+    ruleaza()

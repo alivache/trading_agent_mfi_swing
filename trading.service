@@ -1,0 +1,15 @@
+[Unit]
+Description=Agent Trading Multi-Timeframe (v3)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=liviu_anton
+WorkingDirectory=/home/liviu_anton/trading-v3
+ExecStart=/home/liviu_anton/trading/venv/bin/python3 /home/liviu_anton/trading-v3/multi_tf_strategy.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

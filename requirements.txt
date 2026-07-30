@@ -1,0 +1,10 @@
+yfinance==0.2.51
+alpaca-trade-api==3.2.0
+pandas==2.2.3
+numpy==1.26.4
+python-dotenv==1.0.1
+Flask==3.0.3
+hmmlearn==0.3.2
+scikit-learn==1.5.2
+pytest==8.3.4
+requests==2.32.3
