@@ -72,6 +72,7 @@ TAKE_PROFIT_PCT = 0.04              # +4%
 TRAILING_ACTIVARE_PCT = 0.015       # trailing se activeaza la +1.5%
 TRAILING_DISTANTA_PCT = 0.01        # iesire daca scade 1% de la max
 RSI_5M_EXIT = 78                    # iesire daca RSI(5m) > 78
+CORP_MIN_DIN_ATR = 0.3              # corpul lumanarii 5m, minim 30% din ATR
 COOLDOWN_ORE = 4                    # cooldown 4h dupa o pierdere
 EARNINGS_BLOCARE_ZILE = 1           # blocheaza daca earnings in <= 1 zi
 STOP_INTRARI_ORE_INAINTE = 2        # fara intrari noi cu 2h inainte de inchidere
@@ -207,25 +208,26 @@ def verifica_15m(simbol):
 
 
 def verifica_5m(simbol):
-    """Candle verde, EMA9 > EMA21, 45 < RSI < 70, corp > ATR*0.3."""
+    """Candle verde, EMA9 > EMA21, 45 < RSI < 70, corp > ATR*CORP_MIN_DIN_ATR."""
     df = get_date(simbol, "5m", "1d")
     if df is None or len(df) < 20:
         return False, {"motiv": "date 5m insuficiente"}
     inchideri = df["Close"].tolist()
     pret = inchideri[-1]
     open_ = df["Open"].iloc[-1]
-    high = df["High"].iloc[-1]
-    low = df["Low"].iloc[-1]
     ema9 = calculeaza_ema(inchideri, 9)
     ema21 = calculeaza_ema(inchideri, 21)
     rsi = calculeaza_rsi(inchideri, 14)
     atr = calculeaza_atr(df, 14)
     verde = pret > open_
-    corp_solid = (high - low) > atr * 0.3
+    # Corpul lumanarii, nu range-ul: o lumanare cu umbre lungi si corp mic
+    # inseamna indecizie, nu impuls, si nu trebuie sa treaca filtrul.
+    corp = abs(pret - open_)
+    corp_solid = corp > atr * CORP_MIN_DIN_ATR
     ok = verde and (ema9 > ema21) and (45 < rsi < 70) and corp_solid
     return ok, {"pret": round(pret, 2), "ema9": round(ema9, 2),
                 "ema21": round(ema21, 2), "rsi": round(rsi, 1),
-                "atr": round(atr, 2)}
+                "atr": round(atr, 2), "corp": round(corp, 2)}
 
 
 def analizeaza_semnal(simbol):
@@ -594,9 +596,75 @@ def afiseaza_config():
     print("-" * 60)
 
 
+def reconciliaza(pozitii_locale, pozitii_broker):
+    """Aliniaza starea locala la cea a brokerului. Functie pura.
+
+    Brokerul e sursa de adevar: acolo sunt banii. Un fisier de stare
+    desincronizat inseamna fie pozitii reale pe care agentul nu le mai
+    urmareste (deci nu le mai inchide), fie pozitii fantoma care blocheaza
+    sloturi din MAX_POZITII.
+
+    `pozitii_broker` e o lista de (simbol, cantitate, pret_mediu_intrare).
+    Returneaza (pozitii_corectate, mesaje).
+    """
+    corectate = {}
+    mesaje = []
+    broker = {s: (q, p) for s, q, p in pozitii_broker}
+
+    for simbol, (qty, pret_mediu) in broker.items():
+        local = pozitii_locale.get(simbol)
+        if local is None:
+            corectate[simbol] = {
+                "pret_intrare": pret_mediu, "cantitate": qty,
+                "pret_max": pret_mediu, "trailing_activ": False,
+            }
+            mesaje.append(f"➕ {simbol}: pozitie la broker, absenta local — adoptata "
+                          f"({qty} @ ${pret_mediu:.2f})")
+        elif local.get("cantitate") != qty:
+            local = dict(local)
+            mesaje.append(f"🔧 {simbol}: cantitate {local.get('cantitate')} local "
+                          f"vs {qty} la broker — aliniata la broker")
+            local["cantitate"] = qty
+            corectate[simbol] = local
+        else:
+            corectate[simbol] = local
+
+    for simbol in pozitii_locale:
+        if simbol not in broker:
+            mesaje.append(f"➖ {simbol}: pozitie locala inexistenta la broker — eliminata")
+
+    return corectate, mesaje
+
+
+def reconciliaza_la_pornire(pozitii):
+    """Citeste pozitiile reale de la Alpaca si aliniaza starea locala.
+    Daca API-ul nu raspunde, lasa starea neatinsa — mai bine desincronizat
+    decat sa stergem pozitii reale pe baza unui raspuns lipsa."""
+    try:
+        brute = api.list_positions()
+    except Exception as e:
+        print(f"⚠️ Reconciliere esuata (Alpaca nu raspunde): {e}")
+        print("   Se continua cu starea din pozitii_active.json.")
+        return pozitii
+
+    pozitii_broker = [(p.symbol, int(float(p.qty)), float(p.avg_entry_price))
+                      for p in brute]
+    corectate, mesaje = reconciliaza(pozitii, pozitii_broker)
+
+    if mesaje:
+        print("🔄 RECONCILIERE cu Alpaca:")
+        for msg in mesaje:
+            print(f"  {msg}")
+        salveaza_pozitii(corectate)
+    else:
+        print(f"✅ Reconciliere: {len(corectate)} pozitii, starea locala e corecta")
+    return corectate
+
+
 def ruleaza():
     afiseaza_config()
     pozitii = incarca_pozitii()
+    pozitii = reconciliaza_la_pornire(pozitii)
     memorie = incarca_memorie()
 
     ciclu = 0

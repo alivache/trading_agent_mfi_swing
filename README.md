@@ -28,7 +28,7 @@ trading-v3/
 **Intrare** — toate 3 timeframe-uri aliniate:
 - 1D: pret > EMA50 > EMA200, 40 < RSI < 75
 - 15m: EMA20 > EMA50, pullback < 2%, 25 < RSI < 60
-- 5m: candle verde, EMA9 > EMA21, 45 < RSI < 70, corp > ATR*0.3
+- 5m: candle verde, EMA9 > EMA21, 45 < RSI < 70, corp `|close-open|` > ATR*0.3
 
 **Iesire** (prima adevarata castiga):
 1. Trailing stop (activ la +1.5%, iese la -1% de la max)

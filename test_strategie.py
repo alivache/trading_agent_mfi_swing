@@ -223,6 +223,115 @@ def test_scriere_esuata_nu_distruge_fisierul_existent(tmp_path):
 
 
 # ─────────────────────────────────────────────────────────────
+# Filtrul de corp pe 5m
+#
+# Seria e calibrata astfel incat verde, EMA9>EMA21 si RSI in 45-70 sa fie
+# toate adevarate; singura variabila ramane ultima lumanare, deci rezultatul
+# lui verifica_5m depinde exclusiv de filtrul de corp.
+# ─────────────────────────────────────────────────────────────
+def _serie_5m(ultima_open, ultima_close, ultima_high, ultima_low):
+    import pandas as pd
+
+    o, h, l, c = [], [], [], []
+    pret = 100.0
+    for i in range(40):
+        deschidere = pret
+        pret += 0.5 if i % 2 == 0 else -0.35
+        o.append(deschidere)
+        c.append(pret)
+        h.append(max(deschidere, pret) + 0.1)
+        l.append(min(deschidere, pret) - 0.1)
+    o[-1], c[-1], h[-1], l[-1] = ultima_open, ultima_close, ultima_high, ultima_low
+    return pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c,
+                         "Volume": [1000] * 40})
+
+
+BAZA_5M = 103.35   # pretul dinaintea ultimei bare, pentru seria de mai sus
+
+
+def test_5m_accepta_lumanare_cu_corp_solid(monkeypatch):
+    df = _serie_5m(BAZA_5M, BAZA_5M + 1.0, BAZA_5M + 1.1, BAZA_5M - 0.1)
+    monkeypatch.setattr(m, "get_date", lambda *a, **k: df)
+    ok, info = m.verifica_5m("X")
+    assert ok, "lumanarea cu corp solid trebuie acceptata"
+    assert info["corp"] == pytest.approx(1.0)
+
+
+def test_5m_respinge_corp_mic_cu_umbre_lungi(monkeypatch):
+    """Range-ul e urias (4.0) dar corpul e 0.02: indecizie, nu impuls.
+    Filtrul vechi, pe high-low, lasa asta sa treaca."""
+    df = _serie_5m(BAZA_5M, BAZA_5M + 0.02, BAZA_5M + 2.0, BAZA_5M - 2.0)
+    monkeypatch.setattr(m, "get_date", lambda *a, **k: df)
+    ok, info = m.verifica_5m("X")
+    assert not ok, "corpul sub prag trebuie respins, oricat de mare ar fi range-ul"
+    assert info["corp"] == pytest.approx(0.02)
+
+
+def test_5m_date_insuficiente(monkeypatch):
+    monkeypatch.setattr(m, "get_date", lambda *a, **k: None)
+    ok, info = m.verifica_5m("X")
+    assert not ok
+    assert "insuficiente" in info["motiv"]
+
+
+# ─────────────────────────────────────────────────────────────
+# Reconciliere cu brokerul
+# ─────────────────────────────────────────────────────────────
+def test_reconciliere_stare_deja_corecta():
+    locale = {"AAPL": poz(pret_intrare=150.0, cantitate=10)}
+    corectate, mesaje = m.reconciliaza(locale, [("AAPL", 10, 150.0)])
+    assert mesaje == []
+    assert corectate["AAPL"]["cantitate"] == 10
+
+
+def test_reconciliere_adopta_pozitie_necunoscuta_local():
+    """Pozitie reala la broker pe care agentul nu o urmarea — altfel n-ar fi inchis-o."""
+    corectate, mesaje = m.reconciliaza({}, [("TSLA", 5, 200.0)])
+    assert corectate["TSLA"]["cantitate"] == 5
+    assert corectate["TSLA"]["pret_intrare"] == 200.0
+    assert corectate["TSLA"]["pret_max"] == 200.0
+    assert corectate["TSLA"]["trailing_activ"] is False
+    assert len(mesaje) == 1
+
+
+def test_reconciliere_elimina_pozitia_fantoma():
+    """Pozitie locala inexistenta la broker — bloca un slot din MAX_POZITII."""
+    locale = {"NVDA": poz(cantitate=3)}
+    corectate, mesaje = m.reconciliaza(locale, [])
+    assert corectate == {}
+    assert len(mesaje) == 1
+
+
+def test_reconciliere_aliniaza_cantitatea_la_broker():
+    locale = {"AAPL": poz(pret_intrare=150.0, cantitate=10)}
+    corectate, _ = m.reconciliaza(locale, [("AAPL", 7, 150.0)])
+    assert corectate["AAPL"]["cantitate"] == 7
+
+
+def test_reconciliere_pastreaza_pret_intrare_si_trailing_local():
+    """La aliniere de cantitate nu se pierde istoricul pozitiei."""
+    locale = {"AAPL": poz(pret_intrare=150.0, pret_max=160.0,
+                          trailing_activ=True, cantitate=10)}
+    corectate, _ = m.reconciliaza(locale, [("AAPL", 7, 155.0)])
+    assert corectate["AAPL"]["pret_intrare"] == 150.0
+    assert corectate["AAPL"]["pret_max"] == 160.0
+    assert corectate["AAPL"]["trailing_activ"] is True
+
+
+def test_reconciliere_nu_modifica_dictionarul_primit():
+    locale = {"AAPL": poz(cantitate=10)}
+    m.reconciliaza(locale, [("AAPL", 7, 150.0)])
+    assert locale["AAPL"]["cantitate"] == 10
+
+
+def test_reconciliere_mai_multe_diferente_simultan():
+    locale = {"AAPL": poz(cantitate=10), "NVDA": poz(cantitate=3)}
+    corectate, mesaje = m.reconciliaza(locale, [("AAPL", 10, 100.0), ("TSLA", 5, 200.0)])
+    assert set(corectate) == {"AAPL", "TSLA"}
+    assert len(mesaje) == 2
+
+
+# ─────────────────────────────────────────────────────────────
 # Cooldown
 # ─────────────────────────────────────────────────────────────
 def test_cooldown_activ_imediat_dupa_pierdere():
