@@ -8,19 +8,28 @@ import json
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 # yfinance eliminat - folosim Alpaca IEX
 from dotenv import load_dotenv
 import alpaca_trade_api as tradeapi
 
-# ─────────────────────────────────────────────────────────────
-# Output catre agent.log cu buffering=1 (tail -f vede imediat)
-# ─────────────────────────────────────────────────────────────
 FOLDER = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(FOLDER, "agent.log")
 
-load_dotenv(os.path.join(FOLDER, ".env"))
+# ─────────────────────────────────────────────────────────────
+# FUSUL ORAR AL PIETEI
+# Toata logica de "zi de tranzactionare" (resetare contoare, nume CSV,
+# ora din log, cooldown, earnings) se raporteaza la New York, nu la ceasul
+# masinii. Altfel un VM pe UTC si unul pe ora Romaniei dau rezultate diferite.
+# ─────────────────────────────────────────────────────────────
+NY_TZ = ZoneInfo("America/New_York")
+
+
+def acum_ny():
+    """Momentul curent in fusul bursei (aware)."""
+    return datetime.now(NY_TZ)
 
 
 def _redirect_log():
@@ -28,6 +37,9 @@ def _redirect_log():
     _logfile = open(LOG_PATH, "a", buffering=1, encoding="utf-8")
     sys.stdout = _logfile
     sys.stderr = _logfile
+
+
+load_dotenv(os.path.join(FOLDER, ".env"))
 
 # ─────────────────────────────────────────────────────────────
 # CONFIGURARE
@@ -111,25 +123,21 @@ def calculeaza_atr(df, perioada=14):
     return tr.rolling(perioada).mean().iloc[-1]
 
 
-# Mapare timeframe yfinance -> Alpaca
 _TF_MAP = {"1d": "1Day", "15m": "15Min", "5m": "5Min"}
 _PERIOD_ZILE = {"200d": 300, "5d": 8, "1d": 3}
 
 
 def get_date(simbol, interval, period):
-    """Descarca OHLCV de la Alpaca IEX (nu yfinance — evita rate-limit).
-    Coloane compatibile cu restul codului: Open/High/Low/Close."""
+    """Descarca OHLCV de la Alpaca IEX (nu yfinance — evita rate-limit)."""
     from datetime import datetime, timedelta, timezone
     tf = _TF_MAP.get(interval, "1Day")
     zile = _PERIOD_ZILE.get(period, 30)
-    # end = acum - 16 min (planul gratuit nu da ultimele 15 min); format RFC3339 UTC
     end = (datetime.now(timezone.utc) - timedelta(minutes=16)).strftime("%Y-%m-%dT%H:%M:%SZ")
     start = (datetime.now(timezone.utc) - timedelta(days=zile)).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         bars = api.get_bars(simbol, tf, start=start, end=end, feed="iex").df
         if bars is None or bars.empty:
             return None
-        # Redenumeste coloanele ca sa fie compatibile (Open/High/Low/Close)
         df = bars.rename(columns={
             "open": "Open", "high": "High", "low": "Low",
             "close": "Close", "volume": "Volume"
@@ -255,7 +263,7 @@ def salveaza_memorie(memorie):
 
 
 def log_tranzactie(memorie, simbol, tip, pret, cantitate, profit=None, motiv=None):
-    acum = datetime.now()
+    acum = acum_ny()
     memorie["tranzactii"].append({
         "simbol": simbol, "tip": tip, "pret": round(pret, 2),
         "cantitate": cantitate, "profit": round(profit, 2) if profit is not None else None,
@@ -290,7 +298,10 @@ def in_cooldown(memorie, simbol):
         moment = datetime.fromisoformat(ts)
     except Exception:
         return False
-    if datetime.now() - moment > timedelta(hours=COOLDOWN_ORE):
+    if moment.tzinfo is None:
+        # Intrari scrise inainte de trecerea la ore aware — le citim ca ora NY
+        moment = moment.replace(tzinfo=NY_TZ)
+    if acum_ny() - moment > timedelta(hours=COOLDOWN_ORE):
         del memorie["cooldown"][simbol]
         return False
     return True
@@ -301,7 +312,7 @@ _earnings_cache = {"data": None, "valori": {}}
 
 def are_earnings_curand(simbol):
     """True daca simbolul are earnings in <= EARNINGS_BLOCARE_ZILE. Cache pe zi."""
-    azi = datetime.now().strftime("%Y-%m-%d")
+    azi = acum_ny().strftime("%Y-%m-%d")
     if _earnings_cache["data"] != azi:
         _earnings_cache["data"] = azi
         _earnings_cache["valori"] = {}
@@ -310,7 +321,6 @@ def are_earnings_curand(simbol):
 
     rezultat = False
     data_earnings = None
-    # Doar din .env (evitam yfinance complet pentru a nu lovi rate-limit)
     if simbol in EARNINGS_MANUAL:
         try:
             data_earnings = datetime.strptime(EARNINGS_MANUAL[simbol], "%Y-%m-%d").date()
@@ -321,7 +331,7 @@ def are_earnings_curand(simbol):
         try:
             if hasattr(data_earnings, "date"):
                 data_earnings = data_earnings.date()
-            zile = (data_earnings - datetime.now().date()).days
+            zile = (data_earnings - acum_ny().date()).days
             if 0 <= zile <= EARNINGS_BLOCARE_ZILE:
                 rezultat = True
         except Exception:
@@ -509,7 +519,7 @@ def ruleaza():
     memorie = incarca_memorie()
 
     ciclu = 0
-    zi_curenta = datetime.now().strftime("%Y-%m-%d")
+    zi_curenta = acum_ny().strftime("%Y-%m-%d")
     trades_azi = 0
     raport_facut = False
     inchidere_facuta = False
@@ -517,7 +527,7 @@ def ruleaza():
     while True:
         try:
             ciclu += 1
-            acum = datetime.now()
+            acum = acum_ny()
             zi = acum.strftime("%Y-%m-%d")
 
             # Detectare zi noua — reset contoare
@@ -671,5 +681,8 @@ def ruleaza():
 
 
 if __name__ == "__main__":
-    _redirect_log()
+    # In terminal vrem output pe ecran; sub systemd (stdout nu e terminal)
+    # scriem in agent.log. --log forteaza redirectarea si din terminal.
+    if "--log" in sys.argv or not sys.stdout.isatty():
+        _redirect_log()
     ruleaza()

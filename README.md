@@ -12,13 +12,6 @@ Referinta strategie: profit factor ~1.55, win rate ~65% (129 trades in 21 zile).
 trading-v3/
 ├── multi_tf_strategy.py   # Agentul principal LIVE (bucla 60s)
 ├── dashboard.py           # Dashboard Flask (port 8080, read-only)
-├── overnight_policy.py    # Functii pure pentru swing (COMPONENTA 3)
-├── swing_final.py         # Strategie swing HMM (nu ruleaza live)
-├── backtest*.py           # Backtesting (COMPONENTA 4)
-├── raport_zilnic.py       # Utilitar cron
-├── sync_pozitii.py        # Recuperare desincronizare
-├── statistici.py          # Statistici din CSV-uri
-├── genereaza_csv.py       # Regenerare raport zi
 ├── .env                   # Configurare (chei + actiuni) — NU in git
 ├── trading.service        # systemd agent
 ├── dashboard.service      # systemd dashboard
@@ -98,6 +91,12 @@ journalctl -u trading-v3.service -f
 tail -50 ~/trading-v3/agent.log
 ```
 
+Rulat din terminal, agentul scrie pe ecran. Sub systemd (stdout nu e terminal) scrie in `agent.log`.
+Foloseste `--log` daca vrei redirectarea in fisier si dintr-un terminal.
+
+**Toate orele si datele din log, CSV-uri si dashboard sunt in ora New York**, nu a masinii —
+ziua de tranzactionare, resetarea contoarelor si cooldown-ul se raporteaza la bursa.
+
 ## Dashboard
 
 http://<IP_VM>:8080  (sau prin DuckDNS)
@@ -105,21 +104,18 @@ http://<IP_VM>:8080  (sau prin DuckDNS)
 Doua tab-uri: Dashboard (pozitii, tranzactii azi, log, grafice) si Statistici (PF, win rate, pe zi/simbol/motiv).
 Plus API: `GET /api/stats` returneaza JSON.
 
-## Cron (raport zilnic)
-
-```cron
-15 16 * * 1-5 cd /home/liviu_anton/trading-v3 && /home/liviu_anton/trading/venv/bin/python3 raport_zilnic.py >> /home/liviu_anton/trading-v3/cron_raport.log 2>&1
-```
-
 ## Probleme cunoscute si solutii
 
-- **Rate-limit yfinance**: constrangerea principala. Solutii deja in cod: cache earnings pe zi,
-  cache grafice partajat cu dashboard, short-circuit pe timeframe-uri. Daca vezi erori "Too Many Requests",
+- **Sursa de date**: yfinance a fost eliminat complet — toate datele OHLCV vin de la Alpaca IEX
+  (`get_date()`), iar earnings-urile doar din `EARNINGS` in .env. Planul gratuit Alpaca da 200 cereri/min
+  si nu returneaza ultimele 15 min de date (de aici decalajul de 16 min din `get_date`).
+  Un ciclu complet cere ~60-70 apeluri, deci limita nu e atinsa. Daca totusi vezi "Too Many Requests",
   mareste SCAN_INTERVAL_SEC sau redu numarul de actiuni.
-- **Desincronizare pozitii**: daca pozitii_active.json nu mai corespunde cu Alpaca, ruleaza `sync_pozitii.py`.
+- **Desincronizare pozitii**: daca pozitii_active.json nu mai corespunde cu Alpaca, opreste agentul,
+  corecteaza manual fisierul (sau sterge-l ca sa reporneasca de la zero) si reporneste serviciul.
 - **Bursa inchisa**: agentul doarme 300s si genereaza raportul. Normal.
 - **Serviciul moare**: nu ar trebui (Restart=always + try/except pe bucla). Verifica `journalctl` pentru cauza.
-- **VM mic (e2-micro, ~955MB RAM)**: swing_final.py cu HMM poate fi prea greu. Ruleaza-l manual, nu ca serviciu.
+- **VM mic (e2-micro, ~955MB RAM)**: cele doua servicii incap, dar fara marja. Nu porni procese grele in paralel.
 
 ## Long-only — avertisment
 

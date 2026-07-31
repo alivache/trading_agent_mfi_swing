@@ -6,11 +6,19 @@ import json
 import glob
 import csv
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from flask import Flask, render_template_string, jsonify
 
 FOLDER = os.path.dirname(os.path.abspath(__file__))
 
-# Conexiune Alpaca DOAR pentru soldul contului (nu yfinance — fara rate-limit)
+# Acelasi fus ca agentul — tranzactiile sunt stampilate in ora New York,
+# deci "azi" trebuie calculat la fel, altfel dashboard-ul rateaza ziua.
+NY_TZ = ZoneInfo("America/New_York")
+
+
+def acum_ny():
+    return datetime.now(NY_TZ)
+
 from dotenv import load_dotenv
 load_dotenv(os.path.join(FOLDER, ".env"))
 try:
@@ -311,7 +319,6 @@ def get_cash_valoare():
             return float(acc.portfolio_value), float(acc.cash)
         except Exception:
             pass
-    # Fallback daca Alpaca nu raspunde
     memorie = incarca_json(MEMORIE_FILE, {"stats": {}})
     profit_total = memorie.get("stats", {}).get("total_profit", 0)
     return 100000 + profit_total, 100000 + profit_total
@@ -321,13 +328,13 @@ def get_cash_valoare():
 def dashboard():
     memorie, pozitii, stats = date_comune()
     grafice = incarca_json(GRAFICE_FILE, {})
-    azi = datetime.now().strftime("%Y-%m-%d")
+    azi = acum_ny().strftime("%Y-%m-%d")
     tranzactii_azi = [t for t in memorie.get("tranzactii", []) if t["data"] == azi]
     profit_azi = sum(t["profit"] for t in tranzactii_azi
                      if t["tip"] == "close_long" and t.get("profit") is not None)
     valoare, cash = get_cash_valoare()
     return render_template_string(
-        PAGINA, tab="dashboard", acum=datetime.now().strftime("%H:%M:%S"),
+        PAGINA, tab="dashboard", acum=acum_ny().strftime("%H:%M:%S"),
         status_bursa="🟢 Bursa deschisa" if _bursa_pare_deschisa(memorie) else "🔴 Bursa inchisa",
         cash=cash, valoare=valoare, profit_azi=profit_azi, stats=stats,
         pozitii=pozitii, tranzactii_azi=list(reversed(tranzactii_azi)),
@@ -340,7 +347,7 @@ def dashboard():
 def statistici():
     memorie, pozitii, stats = date_comune()
     return render_template_string(
-        PAGINA, tab="statistici", acum=datetime.now().strftime("%H:%M:%S"),
+        PAGINA, tab="statistici", acum=acum_ny().strftime("%H:%M:%S"),
         status_bursa="", stats=stats,
         pe_zi=stats_pe_zi(memorie), pe_simbol=stats_pe_simbol(memorie),
         pe_motiv=stats_pe_motiv(memorie),
@@ -363,7 +370,7 @@ def _bursa_pare_deschisa(memorie):
     if not tranzactii:
         return False
     ultima = tranzactii[-1]
-    return ultima.get("data") == datetime.now().strftime("%Y-%m-%d")
+    return ultima.get("data") == acum_ny().strftime("%Y-%m-%d")
 
 
 if __name__ == "__main__":
