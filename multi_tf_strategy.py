@@ -78,6 +78,8 @@ STOP_INTRARI_ORE_INAINTE = 2        # fara intrari noi cu 2h inainte de inchider
 INCHIDERE_MIN_INAINTE = 15          # inchide tot cu 15 min inainte de inchidere
 CACHE_GRAFICE_CICLURI = 5           # scrie cache grafice la fiecare 5 cicluri (bursa deschisa)
 CACHE_GRAFICE_CICLURI_INCHIS = 10   # la fiecare 10 cand bursa e inchisa
+ORDIN_TIMEOUT_SEC = 20              # cat asteptam executia unui ordin market
+ORDIN_POLL_SEC = 1                  # interval de interogare a starii ordinului
 
 # Fisiere de stare
 POZITII_FILE = os.path.join(FOLDER, "pozitii_active.json")
@@ -127,24 +129,45 @@ _TF_MAP = {"1d": "1Day", "15m": "15Min", "5m": "5Min"}
 _PERIOD_ZILE = {"200d": 300, "5d": 8, "1d": 3}
 
 
+_FMT_RFC3339 = "%Y-%m-%dT%H:%M:%SZ"
+_DECALAJ_FALLBACK_MIN = 16   # folosit doar daca planul refuza barele recente
+
+
 def get_date(simbol, interval, period):
-    """Descarca OHLCV de la Alpaca IEX (nu yfinance — evita rate-limit)."""
-    from datetime import datetime, timedelta, timezone
+    """Descarca OHLCV de la Alpaca IEX (nu yfinance — evita rate-limit).
+    Cere barele pana in momentul curent; daca abonamentul le refuza,
+    reincearca o singura data cu decalaj."""
     tf = _TF_MAP.get(interval, "1Day")
     zile = _PERIOD_ZILE.get(period, 30)
-    end = (datetime.now(timezone.utc) - timedelta(minutes=16)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    start = (datetime.now(timezone.utc) - timedelta(days=zile)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    acum = datetime.now(timezone.utc)
+    start = (acum - timedelta(days=zile)).strftime(_FMT_RFC3339)
     try:
-        bars = api.get_bars(simbol, tf, start=start, end=end, feed="iex").df
-        if bars is None or bars.empty:
+        bars = api.get_bars(simbol, tf, start=start,
+                            end=acum.strftime(_FMT_RFC3339), feed="iex").df
+    except Exception:
+        try:
+            end = (acum - timedelta(minutes=_DECALAJ_FALLBACK_MIN)).strftime(_FMT_RFC3339)
+            bars = api.get_bars(simbol, tf, start=start, end=end, feed="iex").df
+        except Exception as e:
+            print(f"  ⚠️ get_date {simbol} {interval}: {e}")
             return None
-        df = bars.rename(columns={
-            "open": "Open", "high": "High", "low": "Low",
-            "close": "Close", "volume": "Volume"
-        })
-        return df[["Open", "High", "Low", "Close", "Volume"]]
+    if bars is None or bars.empty:
+        return None
+    df = bars.rename(columns={
+        "open": "Open", "high": "High", "low": "Low",
+        "close": "Close", "volume": "Volume"
+    })
+    return df[["Open", "High", "Low", "Close", "Volume"]]
+
+
+def get_pret_curent(simbol):
+    """Ultimul pret tranzactionat, in timp real. Deciziile de iesire
+    (SL/TP/trailing) trebuie luate pe pretul de acum, nu pe inchiderea
+    ultimei bare, care poate fi veche de cateva minute."""
+    try:
+        return float(api.get_latest_trade(simbol).p)
     except Exception as e:
-        print(f"  ⚠️ get_date {simbol} {interval}: {e}")
+        print(f"  ⚠️ pret curent {simbol}: {e}")
         return None
 
 
@@ -226,21 +249,40 @@ def analizeaza_semnal(simbol):
 # PERSISTENTA
 # ═════════════════════════════════════════════════════════════
 def incarca_json(cale, implicit):
-    if os.path.exists(cale):
+    if not os.path.exists(cale):
+        return implicit
+    try:
+        with open(cale, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        # Nu inghitim eroarea in tacere: pe pozitii_active.json, un default gol
+        # ar insemna "nicio pozitie deschisa" si agentul n-ar mai inchide nimic.
+        print(f"❌ {cale} nu poate fi citit: {e}")
         try:
-            with open(cale, encoding="utf-8") as f:
-                return json.load(f)
+            avarie = f"{cale}.corupt"
+            os.replace(cale, avarie)
+            print(f"   fisierul a fost pastrat pentru inspectie: {avarie}")
         except Exception:
-            return implicit
-    return implicit
+            pass
+        return implicit
 
 
 def salveaza_json(cale, date):
+    """Scriere atomica: fisier temporar + rename. Daca procesul moare la
+    mijloc, vechiul fisier ramane intact in loc sa fie trunchiat."""
+    tmp = f"{cale}.tmp"
     try:
-        with open(cale, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(date, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, cale)
     except Exception as e:
         print(f"❌ Eroare salvare {cale}: {e}")
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
 
 
 def incarca_pozitii():
@@ -365,13 +407,52 @@ def calculeaza_cantitate(pret, atr):
 # ORDINE
 # ═════════════════════════════════════════════════════════════
 def plaseaza_ordin(simbol, cantitate, side):
+    """Trimite ordinul si asteapta executia efectiva.
+
+    Returneaza (pret_executie, cantitate_executata) sau None daca ordinul
+    nu s-a executat. Un ordin acceptat de API nu inseamna un ordin executat:
+    fara verificarea asta, pretul de intrare inregistrat ar fi o estimare,
+    iar o pozitie ar putea exista local fara sa existe la broker.
+    """
     try:
-        api.submit_order(symbol=simbol, qty=cantitate, side=side,
-                         type="market", time_in_force="gtc")
-        return True
+        ordin = api.submit_order(symbol=simbol, qty=cantitate, side=side,
+                                 type="market", time_in_force="day")
     except Exception as e:
-        print(f"❌ Ordin {side} {simbol} esuat: {e}")
-        return False
+        print(f"❌ Ordin {side} {simbol} respins la trimitere: {e}")
+        return None
+
+    limita = time.monotonic() + ORDIN_TIMEOUT_SEC
+    while time.monotonic() < limita:
+        try:
+            o = api.get_order(ordin.id)
+        except Exception as e:
+            print(f"  ⚠️ nu pot citi starea ordinului {simbol}: {e}")
+            time.sleep(ORDIN_POLL_SEC)
+            continue
+        if o.status == "filled":
+            return float(o.filled_avg_price), int(float(o.filled_qty))
+        if o.status in ("canceled", "expired", "rejected", "suspended"):
+            print(f"❌ Ordin {side} {simbol}: {o.status}")
+            return None
+        time.sleep(ORDIN_POLL_SEC)
+
+    # Timeout — anulam ca sa nu ramana un ordin in asteptare peste cicluri,
+    # apoi verificam daca s-a executat partial inainte de anulare.
+    try:
+        api.cancel_order(ordin.id)
+    except Exception:
+        pass
+    try:
+        o = api.get_order(ordin.id)
+        qty = int(float(o.filled_qty or 0))
+        if qty > 0:
+            pret = float(o.filled_avg_price)
+            print(f"  ⚠️ {simbol}: executie partiala {qty}/{cantitate} @ ${pret:.2f}")
+            return pret, qty
+    except Exception:
+        pass
+    print(f"❌ Ordin {side} {simbol}: neexecutat in {ORDIN_TIMEOUT_SEC}s, anulat")
+    return None
 
 
 # ═════════════════════════════════════════════════════════════
@@ -579,18 +660,21 @@ def ruleaza():
                 print(f"🔔 END OF DAY — inchid toate pozitiile ({len(pozitii)})")
                 for simbol in list(pozitii.keys()):
                     poz = pozitii[simbol]
-                    try:
-                        df5 = get_date(simbol, "5m", "1d")
-                        pret = df5["Close"].iloc[-1] if df5 is not None else poz["pret_intrare"]
-                    except Exception:
-                        pret = poz["pret_intrare"]
-                    if plaseaza_ordin(simbol, poz["cantitate"], "sell"):
-                        profit = (pret - poz["pret_intrare"]) * poz["cantitate"]
-                        log_tranzactie(memorie, simbol, "close_long", pret,
-                                       poz["cantitate"], profit, "END OF DAY")
+                    executie = plaseaza_ordin(simbol, poz["cantitate"], "sell")
+                    if executie:
+                        pret_exec, qty_exec = executie
+                        profit = (pret_exec - poz["pret_intrare"]) * qty_exec
+                        log_tranzactie(memorie, simbol, "close_long", pret_exec,
+                                       qty_exec, profit, "END OF DAY")
                         emoji = "🟢" if profit >= 0 else "🔴"
                         print(f"  {emoji} {simbol} inchis EOD: ${profit:.2f}")
-                        del pozitii[simbol]
+                        if qty_exec < poz["cantitate"]:
+                            poz["cantitate"] -= qty_exec
+                            print(f"  ⚠️ {simbol}: raman {poz['cantitate']} actiuni nevandute")
+                        else:
+                            del pozitii[simbol]
+                    else:
+                        print(f"  ⚠️ {simbol}: NU s-a putut inchide EOD — pozitia ramane")
                 salveaza_pozitii(pozitii)
                 salveaza_memorie(memorie)
                 genereaza_raport_csv(memorie, zi)
@@ -605,21 +689,31 @@ def ruleaza():
                     if df5 is None or len(df5) < 21:
                         continue
                     inchideri = df5["Close"].tolist()
-                    pret = inchideri[-1]
+                    # Indicatorii vin din bare, dar SL/TP/trailing se evalueaza
+                    # pe pretul curent — o bara de 5m poate fi deja invechita.
+                    pret = get_pret_curent(simbol) or inchideri[-1]
                     ema9 = calculeaza_ema(inchideri, 9)
                     ema21 = calculeaza_ema(inchideri, 21)
                     rsi_5m = calculeaza_rsi(inchideri, 14)
                     iesire, motiv = verifica_iesire(simbol, poz, pret, ema9, ema21, rsi_5m)
                     if iesire:
-                        if plaseaza_ordin(simbol, poz["cantitate"], "sell"):
-                            profit = (pret - poz["pret_intrare"]) * poz["cantitate"]
-                            log_tranzactie(memorie, simbol, "close_long", pret,
-                                           poz["cantitate"], profit, motiv)
+                        executie = plaseaza_ordin(simbol, poz["cantitate"], "sell")
+                        if executie:
+                            pret_exec, qty_exec = executie
+                            profit = (pret_exec - poz["pret_intrare"]) * qty_exec
+                            log_tranzactie(memorie, simbol, "close_long", pret_exec,
+                                           qty_exec, profit, motiv)
                             emoji = "🟢" if profit >= 0 else "🔴"
                             print(f"  {emoji} IESIRE {simbol}: {motiv} | ${profit:.2f}")
-                            del pozitii[simbol]
+                            if qty_exec < poz["cantitate"]:
+                                poz["cantitate"] -= qty_exec
+                                print(f"  ⚠️ {simbol}: raman {poz['cantitate']} actiuni")
+                            else:
+                                del pozitii[simbol]
                             salveaza_pozitii(pozitii)
                             salveaza_memorie(memorie)
+                        else:
+                            print(f"  ⚠️ {simbol}: iesire esuata, pozitia ramane deschisa")
                     else:
                         salveaza_pozitii(pozitii)  # pentru pret_max/trailing actualizat
                 except Exception as e:
@@ -647,19 +741,23 @@ def ruleaza():
                         semnal, motiv, info = analizeaza_semnal(simbol)
                         if semnal:
                             df5 = get_date(simbol, "5m", "1d")
-                            pret = df5["Close"].iloc[-1]
+                            pret = get_pret_curent(simbol) or df5["Close"].iloc[-1]
                             atr = calculeaza_atr(df5, 14)
                             cantitate = calculeaza_cantitate(pret, atr)
                             print(f"  ⭐ SEMNAL {simbol}: {motiv}")
-                            if plaseaza_ordin(simbol, cantitate, "buy"):
+                            executie = plaseaza_ordin(simbol, cantitate, "buy")
+                            if executie:
+                                # Pretul si cantitatea vin din executia reala,
+                                # nu din estimarea de dinaintea ordinului.
+                                pret_exec, qty_exec = executie
                                 pozitii[simbol] = {
-                                    "pret_intrare": pret, "cantitate": cantitate,
-                                    "pret_max": pret, "trailing_activ": False
+                                    "pret_intrare": pret_exec, "cantitate": qty_exec,
+                                    "pret_max": pret_exec, "trailing_activ": False
                                 }
-                                log_tranzactie(memorie, simbol, "open_long", pret,
-                                               cantitate, None, motiv)
+                                log_tranzactie(memorie, simbol, "open_long", pret_exec,
+                                               qty_exec, None, motiv)
                                 trades_azi += 1
-                                print(f"  ✅ INTRARE {simbol}: {cantitate} @ ${pret:.2f}")
+                                print(f"  ✅ INTRARE {simbol}: {qty_exec} @ ${pret_exec:.2f}")
                                 salveaza_pozitii(pozitii)
                                 salveaza_memorie(memorie)
                         else:
