@@ -397,12 +397,20 @@ def get_portofoliu():
 
 
 def calculeaza_cantitate(pret, atr):
+    """Returneaza (cantitate, stop_loss_pct).
+
+    Stopul returnat e cel folosit la dimensionare si trebuie sa fie exact
+    stopul executat mai tarziu. Daca dimensionam pentru un stop de 3% dar
+    iesim la 1.5% fix, riscul real per tranzactie e jumatate din cel
+    planificat, iar pe simbolurile volatile stopul strans e atins de
+    zgomotul normal, nu de invalidarea setup-ului.
+    """
     portofoliu = get_portofoliu()
     risc_max = portofoliu * RISC_PORTOFOLIU_PCT
-    stop_loss_dinamic = max(STOP_LOSS_MIN_PCT, atr / pret * 1.5)
-    cantitate_risc = int(risc_max / (pret * stop_loss_dinamic))
+    stop_loss_pct = max(STOP_LOSS_MIN_PCT, atr / pret * 1.5)
+    cantitate_risc = int(risc_max / (pret * stop_loss_pct))
     cantitate_size = int(MAX_TRADE_SIZE_USD / pret)
-    return max(1, min(cantitate_risc, cantitate_size))
+    return max(1, min(cantitate_risc, cantitate_size)), stop_loss_pct
 
 
 # ═════════════════════════════════════════════════════════════
@@ -458,6 +466,115 @@ def plaseaza_ordin(simbol, cantitate, side):
 
 
 # ═════════════════════════════════════════════════════════════
+# STOP LA BROKER
+#
+# Stopul evaluat doar in bucla proprie protejeaza pozitia doar cat timp
+# procesul ruleaza si Alpaca raspunde. Un stop lasat la broker ramane activ
+# si daca agentul cade sau reteaua pica, si se executa la pretul lui, nu la
+# cat a apucat sa alunece pretul intre doua cicluri.
+# ═════════════════════════════════════════════════════════════
+def plaseaza_stop(simbol, cantitate, pret_stop):
+    """Trimite un ordin stop de vanzare la broker. Returneaza id-ul sau None."""
+    try:
+        o = api.submit_order(symbol=simbol, qty=cantitate, side="sell",
+                             type="stop", time_in_force="day",
+                             stop_price=round(pret_stop, 2))
+        return o.id
+    except Exception as e:
+        print(f"  ⚠️ {simbol}: stop la broker neplasat: {e}")
+        return None
+
+
+def anuleaza_stop(simbol, poz):
+    """Anuleaza stopul inainte de o vanzare initiata de agent.
+
+    Actiunile sunt blocate de ordinul stop deschis, deci fara anulare
+    ordinul de vanzare al agentului e respins pentru cantitate insuficienta.
+    Returneaza ("anulat" | "executat" | "absent" | "necunoscut", executie),
+    unde executie e (pret, cantitate) doar daca stopul s-a executat chiar
+    in timpul anularii.
+    """
+    oid = poz.pop("stop_order_id", None)
+    if not oid:
+        return "absent", None
+    try:
+        api.cancel_order(oid)
+    except Exception:
+        pass  # poate fi deja intr-o stare terminala; verificam mai jos
+    limita = time.monotonic() + ORDIN_TIMEOUT_SEC
+    while time.monotonic() < limita:
+        try:
+            o = api.get_order(oid)
+        except Exception:
+            time.sleep(ORDIN_POLL_SEC)
+            continue
+        if o.status == "filled":
+            return "executat", (float(o.filled_avg_price), int(float(o.filled_qty)))
+        if o.status in ("canceled", "expired", "rejected", "suspended", "done_for_day"):
+            return "anulat", None
+        time.sleep(ORDIN_POLL_SEC)
+    print(f"  ⚠️ {simbol}: stopul nu s-a anulat in {ORDIN_TIMEOUT_SEC}s")
+    return "necunoscut", None
+
+
+def sincronizeaza_stop(simbol, poz, memorie):
+    """Aliniaza stopul de la broker cu starea locala, la inceputul fiecarui ciclu.
+
+    Trei situatii: stopul s-a executat intre cicluri (pozitia e deja inchisa
+    la broker si trebuie inregistrata local, altfel ramane o pozitie fantoma
+    pe care agentul incearca s-o vanda inca o data), stopul lipseste ori a
+    expirat (se replaseaza — asa se acopera si pozitiile adoptate la
+    reconciliere si stopurile `day` expirate), sau e activ si nu se face nimic.
+
+    Returneaza "iesit" daca stopul a inchis pozitia.
+    """
+    oid = poz.get("stop_order_id")
+    if oid:
+        try:
+            o = api.get_order(oid)
+        except Exception as e:
+            print(f"  ⚠️ {simbol}: nu pot citi starea stopului: {e}")
+            return None
+        if o.status == "filled":
+            pret_exec = float(o.filled_avg_price)
+            qty_exec = int(float(o.filled_qty))
+            profit = (pret_exec - poz["pret_intrare"]) * qty_exec
+            log_tranzactie(memorie, simbol, "close_long", pret_exec, qty_exec,
+                           profit, "STOP LOSS (broker)")
+            print(f"  🔴 IESIRE {simbol}: STOP LOSS la broker @ ${pret_exec:.2f} "
+                  f"| ${profit:.2f}")
+            poz.pop("stop_order_id", None)
+            return "iesit"
+        if o.status in ("new", "accepted", "held", "pending_new", "partially_filled"):
+            # Cantitatea poate diverge dupa o vanzare partiala sau dupa
+            # reconciliere; un stop pe alta cantitate lasa actiuni neacoperite.
+            if int(float(o.qty)) == poz["cantitate"]:
+                return None
+            print(f"  🔧 {simbol}: stop pe {o.qty} vs {poz['cantitate']} in pozitie "
+                  f"— replasat")
+            stare, executie = anuleaza_stop(simbol, poz)
+            if stare == "executat":
+                pret_exec, qty_exec = executie
+                profit = (pret_exec - poz["pret_intrare"]) * qty_exec
+                log_tranzactie(memorie, simbol, "close_long", pret_exec, qty_exec,
+                               profit, "STOP LOSS (broker)")
+                print(f"  🔴 IESIRE {simbol}: STOP LOSS la broker @ ${pret_exec:.2f} "
+                      f"| ${profit:.2f}")
+                return "iesit"
+            if stare == "necunoscut":
+                return None
+        else:
+            poz.pop("stop_order_id", None)  # terminal fara executie — se replaseaza
+
+    pret_stop = poz["pret_intrare"] * (1 - poz.get("stop_loss_pct", STOP_LOSS_PCT))
+    nou = plaseaza_stop(simbol, poz["cantitate"], pret_stop)
+    if nou:
+        poz["stop_order_id"] = nou
+        print(f"  🛡️ {simbol}: stop la broker @ ${pret_stop:.2f}")
+    return None
+
+
+# ═════════════════════════════════════════════════════════════
 # IESIRE — 5 conditii, prima adevarata castiga
 # ═════════════════════════════════════════════════════════════
 def verifica_iesire(simbol, poz, pret_curent, ema9, ema21, rsi_5m):
@@ -477,8 +594,11 @@ def verifica_iesire(simbol, poz, pret_curent, ema9, ema21, rsi_5m):
         if scadere_de_la_max >= TRAILING_DISTANTA_PCT:
             return True, f"TRAILING STOP (-{scadere_de_la_max*100:.1f}% de la max)"
 
-    # 2. Stop loss -1.5%
-    if pl_pct <= -STOP_LOSS_PCT:
+    # 2. Stop loss — acelasi procent folosit la dimensionarea pozitiei.
+    # Pozitiile mai vechi sau cele adoptate la reconciliere nu au campul,
+    # deci cad pe valoarea fixa.
+    stop_loss_pct = poz.get("stop_loss_pct", STOP_LOSS_PCT)
+    if pl_pct <= -stop_loss_pct:
         return True, f"STOP LOSS ({pl_pct*100:.1f}%)"
 
     # 3. Take profit +4%
@@ -586,7 +706,8 @@ def afiseaza_config():
     print("=" * 60)
     print("🤖 AGENT MULTI-TIMEFRAME (1D + 15m + 5m) — LIVE")
     print("=" * 60)
-    print(f"🛑 SL={STOP_LOSS_PCT*100:.2f}% | TP={TAKE_PROFIT_PCT*100:.2f}% | "
+    print(f"🛑 SL=min {STOP_LOSS_MIN_PCT*100:.2f}% (1.5×ATR, la broker) | "
+          f"TP={TAKE_PROFIT_PCT*100:.2f}% | "
           f"Trailing={TRAILING_DISTANTA_PCT*100:.1f}% (activ la {TRAILING_ACTIVARE_PCT*100:.1f}%)")
     print(f"🎯 15m: pullback<2.0% | RSI 25-60")
     print(f"📅 Blocare earnings: {EARNINGS_BLOCARE_ZILE} zi | Manual: {len(EARNINGS_MANUAL)} simboluri")
@@ -650,6 +771,19 @@ def reconciliaza_la_pornire(pozitii):
     pozitii_broker = [(p.symbol, int(float(p.qty)), float(p.avg_entry_price))
                       for p in brute]
     corectate, mesaje = reconciliaza(pozitii, pozitii_broker)
+
+    # Stopurile ramase de la instanta precedenta au id-uri pe care nu le mai
+    # putem lega de starea locala; lasate acolo s-ar dubla cu cele noi.
+    # Se sterg, iar sincronizeaza_stop le replaseaza la primul ciclu.
+    try:
+        for o in api.list_orders(status="open"):
+            if o.symbol in corectate and o.type == "stop" and o.side == "sell":
+                api.cancel_order(o.id)
+                print(f"  🧹 {o.symbol}: stop vechi anulat, se replaseaza")
+    except Exception as e:
+        print(f"  ⚠️ Nu pot curata ordinele stop vechi: {e}")
+    for poz in corectate.values():
+        poz.pop("stop_order_id", None)
 
     if mesaje:
         print("🔄 RECONCILIERE cu Alpaca:")
@@ -728,6 +862,19 @@ def ruleaza():
                 print(f"🔔 END OF DAY — inchid toate pozitiile ({len(pozitii)})")
                 for simbol in list(pozitii.keys()):
                     poz = pozitii[simbol]
+                    stare_stop, executie_stop = anuleaza_stop(simbol, poz)
+                    if stare_stop == "executat":
+                        pret_exec, qty_exec = executie_stop
+                        profit = (pret_exec - poz["pret_intrare"]) * qty_exec
+                        log_tranzactie(memorie, simbol, "close_long", pret_exec,
+                                       qty_exec, profit, "STOP LOSS (broker)")
+                        print(f"  🔴 {simbol}: inchis de stopul de la broker "
+                              f"@ ${pret_exec:.2f} | ${profit:.2f}")
+                        del pozitii[simbol]
+                        continue
+                    if stare_stop == "necunoscut":
+                        print(f"  ⚠️ {simbol}: stop in stare incerta — nu vand EOD")
+                        continue
                     executie = plaseaza_ordin(simbol, poz["cantitate"], "sell")
                     if executie:
                         pret_exec, qty_exec = executie
@@ -753,6 +900,14 @@ def ruleaza():
             for simbol in list(pozitii.keys()):
                 poz = pozitii[simbol]
                 try:
+                    # Stopul de la broker se poate executa intre cicluri, si
+                    # trebuie replasat daca lipseste — inainte de orice altceva.
+                    if sincronizeaza_stop(simbol, poz, memorie) == "iesit":
+                        del pozitii[simbol]
+                        salveaza_pozitii(pozitii)
+                        salveaza_memorie(memorie)
+                        continue
+
                     df5 = get_date(simbol, "5m", "1d")
                     if df5 is None or len(df5) < 21:
                         continue
@@ -765,6 +920,21 @@ def ruleaza():
                     rsi_5m = calculeaza_rsi(inchideri, 14)
                     iesire, motiv = verifica_iesire(simbol, poz, pret, ema9, ema21, rsi_5m)
                     if iesire:
+                        stare_stop, executie_stop = anuleaza_stop(simbol, poz)
+                        if stare_stop == "executat":
+                            pret_exec, qty_exec = executie_stop
+                            profit = (pret_exec - poz["pret_intrare"]) * qty_exec
+                            log_tranzactie(memorie, simbol, "close_long", pret_exec,
+                                           qty_exec, profit, "STOP LOSS (broker)")
+                            print(f"  🔴 IESIRE {simbol}: stopul de la broker a "
+                                  f"prins-o primul @ ${pret_exec:.2f} | ${profit:.2f}")
+                            del pozitii[simbol]
+                            salveaza_pozitii(pozitii)
+                            salveaza_memorie(memorie)
+                            continue
+                        if stare_stop == "necunoscut":
+                            print(f"  ⚠️ {simbol}: stop in stare incerta — aman iesirea")
+                            continue
                         executie = plaseaza_ordin(simbol, poz["cantitate"], "sell")
                         if executie:
                             pret_exec, qty_exec = executie
@@ -811,7 +981,7 @@ def ruleaza():
                             df5 = get_date(simbol, "5m", "1d")
                             pret = get_pret_curent(simbol) or df5["Close"].iloc[-1]
                             atr = calculeaza_atr(df5, 14)
-                            cantitate = calculeaza_cantitate(pret, atr)
+                            cantitate, stop_loss_pct = calculeaza_cantitate(pret, atr)
                             print(f"  ⭐ SEMNAL {simbol}: {motiv}")
                             executie = plaseaza_ordin(simbol, cantitate, "buy")
                             if executie:
@@ -820,12 +990,24 @@ def ruleaza():
                                 pret_exec, qty_exec = executie
                                 pozitii[simbol] = {
                                     "pret_intrare": pret_exec, "cantitate": qty_exec,
-                                    "pret_max": pret_exec, "trailing_activ": False
+                                    "pret_max": pret_exec, "trailing_activ": False,
+                                    "stop_loss_pct": stop_loss_pct
                                 }
                                 log_tranzactie(memorie, simbol, "open_long", pret_exec,
                                                qty_exec, None, motiv)
                                 trades_azi += 1
-                                print(f"  ✅ INTRARE {simbol}: {qty_exec} @ ${pret_exec:.2f}")
+                                print(f"  ✅ INTRARE {simbol}: {qty_exec} @ ${pret_exec:.2f} "
+                                      f"| SL {stop_loss_pct*100:.2f}%")
+                                # Stopul se calculeaza pe pretul real de executie,
+                                # nu pe estimarea de dinaintea ordinului.
+                                pret_stop = pret_exec * (1 - stop_loss_pct)
+                                oid = plaseaza_stop(simbol, qty_exec, pret_stop)
+                                if oid:
+                                    pozitii[simbol]["stop_order_id"] = oid
+                                    print(f"  🛡️ {simbol}: stop la broker @ ${pret_stop:.2f}")
+                                else:
+                                    print(f"  ⚠️ {simbol}: fara stop la broker — "
+                                          f"se reincearca la ciclul urmator")
                                 salveaza_pozitii(pozitii)
                                 salveaza_memorie(memorie)
                         else:

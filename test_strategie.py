@@ -130,6 +130,42 @@ def test_stop_loss_are_prioritate_fata_de_ema_cross():
 
 
 # ─────────────────────────────────────────────────────────────
+# Stopul folosit la iesire = stopul folosit la dimensionare
+# ─────────────────────────────────────────────────────────────
+def test_stop_din_pozitie_are_prioritate_fata_de_cel_fix():
+    """O pozitie dimensionata cu stop de 3% nu iese la -1.5%."""
+    p = poz()
+    p["stop_loss_pct"] = 0.03
+    assert m.verifica_iesire("X", p, 98.5, ema9=11, ema21=10, rsi_5m=50)[0] is False
+    iesire, motiv = m.verifica_iesire("X", p, 97.0, ema9=11, ema21=10, rsi_5m=50)
+    assert iesire is True
+    assert "STOP LOSS" in motiv
+
+
+def test_pozitie_fara_stop_salvat_cade_pe_valoarea_fixa():
+    """Pozitiile vechi si cele adoptate la reconciliere nu au campul."""
+    p = poz()
+    assert "stop_loss_pct" not in p
+    assert m.verifica_iesire("X", p, 98.5, ema9=11, ema21=10, rsi_5m=50)[0] is True
+
+
+def test_cantitatea_si_stopul_folosesc_acelasi_procent(monkeypatch):
+    """Riscul realizat trebuie sa fie cel planificat: 1% din portofoliu."""
+    monkeypatch.setattr(m, "get_portofoliu", lambda: 100_000.0)
+    pret, atr = 200.0, 8.0  # 1.5×ATR/pret = 6%, peste minimul de 1.5%
+    cantitate, stop_loss_pct = m.calculeaza_cantitate(pret, atr)
+    assert stop_loss_pct == pytest.approx(0.06)
+    risc = cantitate * pret * stop_loss_pct
+    assert risc <= 100_000.0 * m.RISC_PORTOFOLIU_PCT
+
+
+def test_stopul_nu_coboara_sub_minim(monkeypatch):
+    monkeypatch.setattr(m, "get_portofoliu", lambda: 100_000.0)
+    _, stop_loss_pct = m.calculeaza_cantitate(200.0, 0.1)
+    assert stop_loss_pct == pytest.approx(m.STOP_LOSS_MIN_PCT)
+
+
+# ─────────────────────────────────────────────────────────────
 # Indicatori
 # ─────────────────────────────────────────────────────────────
 def test_ema_pe_serie_constanta_este_constanta():
