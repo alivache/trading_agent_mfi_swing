@@ -46,16 +46,42 @@ def test_take_profit_la_plus_4_la_suta():
     assert "TAKE PROFIT" in motiv
 
 
-def test_rsi_supracumparat():
-    iesire, motiv = m.verifica_iesire("X", poz(), 100.5, ema9=11, ema21=10, rsi_5m=79)
+def test_rsi_supracumparat_peste_pragul_de_trailing():
+    iesire, motiv = m.verifica_iesire("X", poz(), 101.6, ema9=11, ema21=10, rsi_5m=79)
     assert iesire is True
     assert "RSI OVERBOUGHT" in motiv
 
 
 def test_rsi_exact_pe_prag_nu_declanseaza():
-    iesire, _ = m.verifica_iesire("X", poz(), 100.5, ema9=11, ema21=10,
+    iesire, _ = m.verifica_iesire("X", poz(), 101.6, ema9=11, ema21=10,
                                   rsi_5m=m.RSI_5M_EXIT)
     assert iesire is False
+
+
+def test_rsi_nu_taie_pozitia_sub_pragul_de_trailing():
+    """Cazul CSCO din 3 august: RSI 86 la +0.2%, iesirea ar fi trunchiat trade-ul."""
+    iesire, _ = m.verifica_iesire("X", poz(), 100.2, ema9=11, ema21=10, rsi_5m=86)
+    assert iesire is False
+
+
+def test_rsi_nu_se_declanseaza_cu_o_fractiune_sub_prag():
+    """+1.4% e sub pragul de trailing de 1.5%, deci RSI-ul inca nu are voie."""
+    iesire, _ = m.verifica_iesire("X", poz(), 101.4, ema9=11, ema21=10, rsi_5m=90)
+    assert iesire is False
+
+
+def test_stop_loss_are_prioritate_fata_de_rsi():
+    """RSI mare pe pierdere nu trebuie sa mascheze stop loss-ul."""
+    iesire, motiv = m.verifica_iesire("X", poz(), 98.5, ema9=11, ema21=10, rsi_5m=90)
+    assert iesire is True
+    assert "STOP LOSS" in motiv
+
+
+def test_ema_cross_ramane_plasa_de_siguranta_sub_prag():
+    """Sub pragul de trailing, momentumul pierdut il prinde EMA cross, nu RSI."""
+    iesire, motiv = m.verifica_iesire("X", poz(), 100.5, ema9=9, ema21=10, rsi_5m=86)
+    assert iesire is True
+    assert "EMA CROSS" in motiv
 
 
 def test_ema_cross_iese_doar_pe_profit():

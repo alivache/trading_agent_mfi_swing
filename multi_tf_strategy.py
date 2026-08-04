@@ -623,9 +623,13 @@ def verifica_iesire(simbol, poz, pret_curent, ema9, ema21, rsi_5m):
     if ema9 < ema21 and pl_pct > 0:
         return True, f"EMA CROSS (EMA9<EMA21, +{pl_pct*100:.1f}%)"
 
-    # 5. RSI(5m) > 78
-    if rsi_5m > RSI_5M_EXIT:
-        return True, f"RSI OVERBOUGHT ({rsi_5m:.1f})"
+    # 5. RSI(5m) > 78, dar numai dupa ce pozitia a ajuns in zona de trailing.
+    # Sub acest prag lasam trade-ul sa respire: altfel RSI-ul inchidea la
+    # +0.2% si trailing-ul (activ de la +1.5%) nu apuca sa preia niciodata
+    # gestiunea. Pe minusul din zona asta raspunde stop loss-ul, iar pe
+    # momentum pierdut raspunde EMA cross.
+    if rsi_5m > RSI_5M_EXIT and pl_pct >= TRAILING_ACTIVARE_PCT:
+        return True, f"RSI OVERBOUGHT ({rsi_5m:.1f}, +{pl_pct*100:.1f}%)"
 
     return False, None
 
