@@ -74,6 +74,7 @@ TRAILING_DISTANTA_PCT = 0.01        # iesire daca scade 1% de la max
 RSI_5M_EXIT = 78                    # iesire daca RSI(5m) > 78
 CORP_MIN_DIN_ATR = 0.3              # corpul lumanarii 5m, minim 30% din ATR
 COOLDOWN_ORE = 4                    # cooldown 4h dupa o pierdere
+COOLDOWN_REINTRARE_MIN = 45         # cooldown 45 min dupa o iesire pe plus
 EARNINGS_BLOCARE_ZILE = 1           # blocheaza daca earnings in <= 1 zi
 STOP_INTRARI_ORE_INAINTE = 2        # fara intrari noi cu 2h inainte de inchidere
 INCHIDERE_MIN_INAINTE = 15          # inchide tot cu 15 min inainte de inchidere
@@ -316,9 +317,12 @@ def log_tranzactie(memorie, simbol, tip, pret, cantitate, profit=None, motiv=Non
     })
     if tip == "close_long" and profit is not None:
         if profit < 0:
-            memorie["cooldown"][simbol] = acum.isoformat()
+            seteaza_cooldown(memorie, simbol, timedelta(hours=COOLDOWN_ORE))
             memorie["stats"]["losses"] += 1
         else:
+            # Si dupa o iesire pe plus blocam reintrarea, ca acelasi semnal
+            # sa nu ne bage inapoi peste cateva minute pe acelasi simbol.
+            seteaza_cooldown(memorie, simbol, timedelta(minutes=COOLDOWN_REINTRARE_MIN))
             memorie["stats"]["wins"] += 1
         memorie["stats"]["total_profit"] += profit
         if simbol not in memorie["performanta"]:
@@ -333,19 +337,29 @@ def log_tranzactie(memorie, simbol, tip, pret, cantitate, profit=None, motiv=Non
 # ═════════════════════════════════════════════════════════════
 # FILTRE
 # ═════════════════════════════════════════════════════════════
+def seteaza_cooldown(memorie, simbol, durata):
+    """Blocheaza reintrarea pe simbol pana la un moment dat (ora NY)."""
+    memorie["cooldown"][simbol] = (acum_ny() + durata).isoformat()
+
+
 def in_cooldown(memorie, simbol):
-    """True daca simbolul e in cooldown (pierdere in ultimele COOLDOWN_ORE)."""
+    """True daca simbolul e blocat la reintrare (vezi seteaza_cooldown).
+
+    Valoarea din memorie e momentul de EXPIRARE, nu cel al iesirii — asa nu
+    trebuie sa stim ce durata s-a aplicat cand s-a inchis pozitia.
+    """
     ts = memorie["cooldown"].get(simbol)
     if not ts:
         return False
     try:
-        moment = datetime.fromisoformat(ts)
+        expira = datetime.fromisoformat(ts)
     except Exception:
+        del memorie["cooldown"][simbol]
         return False
-    if moment.tzinfo is None:
+    if expira.tzinfo is None:
         # Intrari scrise inainte de trecerea la ore aware — le citim ca ora NY
-        moment = moment.replace(tzinfo=NY_TZ)
-    if acum_ny() - moment > timedelta(hours=COOLDOWN_ORE):
+        expira = expira.replace(tzinfo=NY_TZ)
+    if acum_ny() >= expira:
         del memorie["cooldown"][simbol]
         return False
     return True

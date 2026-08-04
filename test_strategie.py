@@ -370,13 +370,23 @@ def test_reconciliere_mai_multe_diferente_simultan():
 # ─────────────────────────────────────────────────────────────
 # Cooldown
 # ─────────────────────────────────────────────────────────────
-def test_cooldown_activ_imediat_dupa_pierdere():
-    memorie = {"cooldown": {"AAPL": m.acum_ny().isoformat()}}
+def memorie_goala():
+    return {"tranzactii": [], "performanta": {}, "cooldown": {},
+            "stats": {"total_profit": 0, "wins": 0, "losses": 0}}
+
+
+def minute_pana_la_expirare(memorie, simbol):
+    expira = datetime.fromisoformat(memorie["cooldown"][simbol])
+    return (expira - m.acum_ny()).total_seconds() / 60
+
+
+def test_cooldown_activ_pana_la_expirare():
+    memorie = {"cooldown": {"AAPL": (m.acum_ny() + timedelta(hours=1)).isoformat()}}
     assert m.in_cooldown(memorie, "AAPL") is True
 
 
 def test_cooldown_expira_si_intrarea_este_stearsa():
-    vechi = (m.acum_ny() - timedelta(hours=m.COOLDOWN_ORE + 1)).isoformat()
+    vechi = (m.acum_ny() - timedelta(minutes=1)).isoformat()
     memorie = {"cooldown": {"AAPL": vechi}}
     assert m.in_cooldown(memorie, "AAPL") is False
     assert "AAPL" not in memorie["cooldown"]
@@ -384,10 +394,51 @@ def test_cooldown_expira_si_intrarea_este_stearsa():
 
 def test_cooldown_accepta_timestamp_fara_fus_orar():
     """Compatibilitate cu memorie_multitf.json scris inainte de orele aware."""
-    naiv = datetime.now().replace(tzinfo=None).isoformat()
+    naiv = (m.acum_ny() + timedelta(hours=1)).replace(tzinfo=None).isoformat()
     memorie = {"cooldown": {"AAPL": naiv}}
     assert m.in_cooldown(memorie, "AAPL") is True
 
 
+def test_cooldown_cu_timestamp_corupt_este_curatat():
+    memorie = {"cooldown": {"AAPL": "nu-e-o-data"}}
+    assert m.in_cooldown(memorie, "AAPL") is False
+    assert "AAPL" not in memorie["cooldown"]
+
+
 def test_cooldown_absent_pentru_simbol_necunoscut():
     assert m.in_cooldown({"cooldown": {}}, "AAPL") is False
+
+
+def test_pierderea_da_cooldown_de_patru_ore():
+    memorie = memorie_goala()
+    m.log_tranzactie(memorie, "AAPL", "close_long", 100.0, 10, profit=-50.0)
+    assert m.in_cooldown(memorie, "AAPL") is True
+    assert minute_pana_la_expirare(memorie, "AAPL") == pytest.approx(
+        m.COOLDOWN_ORE * 60, abs=1)
+
+
+def test_iesirea_pe_plus_da_cooldown_de_reintrare():
+    memorie = memorie_goala()
+    m.log_tranzactie(memorie, "CSCO", "close_long", 115.52, 21, profit=1.26)
+    assert m.in_cooldown(memorie, "CSCO") is True
+    assert minute_pana_la_expirare(memorie, "CSCO") == pytest.approx(
+        m.COOLDOWN_REINTRARE_MIN, abs=1)
+
+
+def test_reintrarea_imediata_pe_acelasi_simbol_este_blocata():
+    """Cazul din 3 august: iesire pe +0.1%, reintrare 6 minute mai tarziu."""
+    memorie = memorie_goala()
+    m.log_tranzactie(memorie, "CSCO", "close_long", 115.52, 21, profit=1.26)
+    assert m.in_cooldown(memorie, "CSCO") is True
+
+
+def test_deschiderea_pozitiei_nu_pune_cooldown():
+    memorie = memorie_goala()
+    m.log_tranzactie(memorie, "AAPL", "open_long", 339.46, 7)
+    assert memorie["cooldown"] == {}
+
+
+def test_cooldownul_nu_afecteaza_alte_simboluri():
+    memorie = memorie_goala()
+    m.log_tranzactie(memorie, "CSCO", "close_long", 115.52, 21, profit=1.26)
+    assert m.in_cooldown(memorie, "AVGO") is False
