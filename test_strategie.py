@@ -101,6 +101,60 @@ def test_ema_cross_nu_iese_la_pret_egal_cu_intrarea():
     assert iesire is False
 
 
+def test_ema_cross_nu_iese_sub_pragul_care_acopera_costul():
+    """La +0.2% ordinul market inchidea in pierdere dupa spread."""
+    iesire, _ = m.verifica_iesire("X", poz(), 100.2, ema9=9, ema21=10, rsi_5m=50)
+    assert iesire is False
+
+
+def test_ema_cross_iese_peste_pragul_care_acopera_costul():
+    iesire, motiv = m.verifica_iesire("X", poz(), 100.4, ema9=9, ema21=10, rsi_5m=50)
+    assert iesire is True
+    assert "EMA CROSS" in motiv
+
+
+def test_verifica_iesire_retine_si_minimul_parcurs():
+    p = poz()
+    m.verifica_iesire("X", p, 99.0, ema9=11, ema21=10, rsi_5m=50)
+    m.verifica_iesire("X", p, 100.8, ema9=11, ema21=10, rsi_5m=50)
+    assert p["pret_min"] == 99.0
+    assert p["pret_max"] == 100.8
+
+
+# ─────────────────────────────────────────────────────────────
+# metrici_pozitie — MFE / MAE / durata
+# ─────────────────────────────────────────────────────────────
+def test_metrici_masoara_excursia_maxima_in_ambele_directii():
+    p = poz(pret_max=103.0)
+    p["pret_min"] = 98.5
+    met = m.metrici_pozitie(p, 101.0)
+    assert met["mfe_pct"] == 3.0
+    assert met["mae_pct"] == -1.5
+
+
+def test_metrici_includ_pretul_de_iesire_in_excursie():
+    """Iesirea poate fi ea insasi extrema, daca a picat intre doua cicluri."""
+    met = m.metrici_pozitie(poz(), 104.0)
+    assert met["mfe_pct"] == 4.0
+    met = m.metrici_pozitie(poz(), 97.0)
+    assert met["mae_pct"] == -3.0
+
+
+def test_metrici_calculeaza_durata_din_ora_de_intrare():
+    p = poz()
+    p["ora_intrare"] = (m.acum_ny() - timedelta(minutes=42)).isoformat()
+    assert m.metrici_pozitie(p, 100.0)["durata_min"] == 42
+
+
+def test_metrici_omit_durata_pentru_pozitii_adoptate():
+    """Fara ora de intrare (pozitie preluata la reconciliere) durata lipseste."""
+    assert "durata_min" not in m.metrici_pozitie(poz(), 100.0)
+
+
+def test_metrici_goale_fara_pret_de_intrare():
+    assert m.metrici_pozitie({}, 100.0) == {}
+
+
 # ─────────────────────────────────────────────────────────────
 # Trailing stop
 # ─────────────────────────────────────────────────────────────

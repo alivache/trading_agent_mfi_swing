@@ -34,8 +34,15 @@ trading-v3/
 1. Trailing stop (activ la +1.5%, iese la -1% de la max)
 2. Stop loss -1.5%
 3. Take profit +4%
-4. EMA9 < EMA21 (doar pe profit)
+4. EMA9 < EMA21 (doar peste +0.3%, cat sa acopere costul iesirii)
 5. RSI(5m) > 78
+
+Fiecare inchidere retine si excursia parcursa — `mfe_pct` (cat de sus a ajuns pozitia),
+`mae_pct` (cat de jos) si `durata_min` — in `memorie_multitf.json` si in CSV-ul zilnic.
+Excursiile sunt esantionate la fiecare ciclu (60s) pe ultimul pret tranzactionat, deci sunt
+o limita inferioara a miscarii reale. Sunt baza pentru calibrarea trailing-ului si a lui
+`TAKE_PROFIT_PCT` — fara ele nu se vede decat unde s-a inchis pozitia, nu si unde a ajuns.
+Tranzactiile de dinaintea instrumentarii au coloanele goale.
 
 **Filtre**: cooldown 4h dupa pierdere, blocare earnings (1 zi), max 5 pozitii,
 max trades/zi din .env, fara intrari cu 2h inainte de inchidere, inchidere fortata cu 15 min inainte.

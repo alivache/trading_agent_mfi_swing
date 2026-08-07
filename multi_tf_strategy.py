@@ -72,6 +72,7 @@ TAKE_PROFIT_PCT = 0.04              # +4%
 TRAILING_ACTIVARE_PCT = 0.015       # trailing se activeaza la +1.5%
 TRAILING_DISTANTA_PCT = 0.01        # iesire daca scade 1% de la max
 RSI_5M_EXIT = 78                    # iesire daca RSI(5m) > 78
+EMA_CROSS_MIN_PROFIT_PCT = 0.003    # EMA cross iese doar peste +0.3%
 CORP_MIN_DIN_ATR = 0.3              # corpul lumanarii 5m, minim 30% din ATR
 COOLDOWN_ORE = 4                    # cooldown 4h dupa o pierdere
 COOLDOWN_REINTRARE_MIN = 45         # cooldown 45 min dupa o iesire pe plus
@@ -307,14 +308,51 @@ def salveaza_memorie(memorie):
     salveaza_json(MEMORIE_FILE, memorie)
 
 
-def log_tranzactie(memorie, simbol, tip, pret, cantitate, profit=None, motiv=None):
+def metrici_pozitie(poz, pret_iesire):
+    """MFE/MAE (procente fata de intrare) si durata (minute) a unei pozitii.
+
+    Fara ele nu se poate calibra nici trailing-ul, nici take profit-ul:
+    din istoric se vede doar unde s-a inchis pozitia, nu si cat de sus a
+    ajuns inainte sa se intoarca. `TAKE_PROFIT_PCT` a stat la 4% fara nicio
+    declansare in 27 de tranzactii tocmai pentru ca nimeni nu masura asta.
+
+    Extremele sunt esantionate o data pe ciclu (60s) pe ultimul pret
+    tranzactionat, nu pe maximul/minimul real al barei — sunt deci o limita
+    inferioara a excursiei, la fel ca pretul pe care lucreaza trailing-ul.
+    """
+    pret_intrare = poz.get("pret_intrare")
+    if not pret_intrare:
+        return {}
+    pret_max = max(poz.get("pret_max", pret_intrare), pret_iesire)
+    pret_min = min(poz.get("pret_min", pret_intrare), pret_iesire)
+    metrici = {
+        "mfe_pct": round((pret_max - pret_intrare) / pret_intrare * 100, 2),
+        "mae_pct": round((pret_min - pret_intrare) / pret_intrare * 100, 2),
+    }
+    # Pozitiile adoptate la reconciliere nu au ora de intrare: mai bine lipsa
+    # decat o durata inventata de la repornirea agentului.
+    intrare = poz.get("ora_intrare")
+    if intrare:
+        try:
+            durata = acum_ny() - datetime.fromisoformat(intrare)
+            metrici["durata_min"] = int(durata.total_seconds() // 60)
+        except (TypeError, ValueError):
+            pass
+    return metrici
+
+
+def log_tranzactie(memorie, simbol, tip, pret, cantitate, profit=None, motiv=None,
+                   poz=None):
     acum = acum_ny()
-    memorie["tranzactii"].append({
+    inregistrare = {
         "simbol": simbol, "tip": tip, "pret": round(pret, 2),
         "cantitate": cantitate, "profit": round(profit, 2) if profit is not None else None,
         "motiv": motiv, "ora": acum.strftime("%H:%M:%S"),
         "data": acum.strftime("%Y-%m-%d")
-    })
+    }
+    if tip == "close_long" and poz:
+        inregistrare.update(metrici_pozitie(poz, pret))
+    memorie["tranzactii"].append(inregistrare)
     if tip == "close_long" and profit is not None:
         if profit < 0:
             seteaza_cooldown(memorie, simbol, timedelta(hours=COOLDOWN_ORE))
@@ -554,7 +592,7 @@ def sincronizeaza_stop(simbol, poz, memorie):
             qty_exec = int(float(o.filled_qty))
             profit = (pret_exec - poz["pret_intrare"]) * qty_exec
             log_tranzactie(memorie, simbol, "close_long", pret_exec, qty_exec,
-                           profit, "STOP LOSS (broker)")
+                           profit, "STOP LOSS (broker)", poz)
             print(f"  🔴 IESIRE {simbol}: STOP LOSS la broker @ ${pret_exec:.2f} "
                   f"| ${profit:.2f}")
             poz.pop("stop_order_id", None)
@@ -571,7 +609,7 @@ def sincronizeaza_stop(simbol, poz, memorie):
                 pret_exec, qty_exec = executie
                 profit = (pret_exec - poz["pret_intrare"]) * qty_exec
                 log_tranzactie(memorie, simbol, "close_long", pret_exec, qty_exec,
-                               profit, "STOP LOSS (broker)")
+                               profit, "STOP LOSS (broker)", poz)
                 print(f"  🔴 IESIRE {simbol}: STOP LOSS la broker @ ${pret_exec:.2f} "
                       f"| ${profit:.2f}")
                 return "iesit"
@@ -596,9 +634,11 @@ def verifica_iesire(simbol, poz, pret_curent, ema9, ema21, rsi_5m):
     pret_intrare = poz["pret_intrare"]
     pl_pct = (pret_curent - pret_intrare) / pret_intrare
 
-    # Actualizeaza maximul
+    # Actualizeaza extremele parcurse (pentru MFE/MAE la inchidere)
     if pret_curent > poz.get("pret_max", pret_intrare):
         poz["pret_max"] = pret_curent
+    if pret_curent < poz.get("pret_min", pret_intrare):
+        poz["pret_min"] = pret_curent
 
     # 1. Trailing stop (activ la +1.5%, iesire daca scade 1% de la max)
     if pl_pct >= TRAILING_ACTIVARE_PCT:
@@ -619,8 +659,13 @@ def verifica_iesire(simbol, poz, pret_curent, ema9, ema21, rsi_5m):
     if pl_pct >= TAKE_PROFIT_PCT:
         return True, f"TAKE PROFIT (+{pl_pct*100:.1f}%)"
 
-    # 4. EMA9 < EMA21, doar daca pe profit
-    if ema9 < ema21 and pl_pct > 0:
+    # 4. EMA9 < EMA21, dar numai peste un profit care acopera costul iesirii.
+    # Conditia veche (`pl_pct > 0`) se evalua pe ultimul pret tranzactionat
+    # si executa un ordin market: la +0.0% ordinul se umplea pe partea
+    # gresita a spread-ului si trade-ul se inchidea in pierdere (GOOGL,
+    # 5 august: logat "+0.0%", realizat -0.35 USD). Sub prag lasam stopul
+    # sa decida — nu inchidem in zgomot.
+    if ema9 < ema21 and pl_pct > EMA_CROSS_MIN_PROFIT_PCT:
         return True, f"EMA CROSS (EMA9<EMA21, +{pl_pct*100:.1f}%)"
 
     # 5. RSI(5m) > 78, dar numai dupa ce pozitia a ajuns in zona de trailing.
@@ -648,7 +693,8 @@ def genereaza_raport_csv(memorie, zi):
     with open(cale, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["data_iesire", "simbol", "cantitate", "pret_intrare",
-                    "pret_iesire", "profit_usd", "profit_pct", "motiv_exit", "rezultat"])
+                    "pret_iesire", "profit_usd", "profit_pct", "mfe_pct", "mae_pct",
+                    "durata_min", "motiv_exit", "rezultat"])
         for t in inchideri:
             # Cauta pretul de intrare: primul open_long anterior pe acelasi simbol
             pret_intrare = None
@@ -663,9 +709,13 @@ def genereaza_raport_csv(memorie, zi):
             if pret_intrare:
                 profit_pct = (t["pret"] - pret_intrare) / pret_intrare * 100
             rezultat = "WIN" if profit >= 0 else "LOSS"
+            # Tranzactiile de dinaintea instrumentarii nu au excursii — coloane
+            # goale, nu zerouri: un 0 s-ar amesteca in orice medie ulterioara.
             w.writerow([t["data"] + "T" + t["ora"], t["simbol"], t["cantitate"],
                         pret_intrare, t["pret"], round(profit, 2),
-                        round(profit_pct, 2), t.get("motiv", ""), rezultat])
+                        round(profit_pct, 2), t.get("mfe_pct", ""),
+                        t.get("mae_pct", ""), t.get("durata_min", ""),
+                        t.get("motiv", ""), rezultat])
     print(f"📄 Raport generat: {cale} ({len(inchideri)} inchideri)")
 
 
@@ -755,7 +805,8 @@ def reconciliaza(pozitii_locale, pozitii_broker):
         if local is None:
             corectate[simbol] = {
                 "pret_intrare": pret_mediu, "cantitate": qty,
-                "pret_max": pret_mediu, "trailing_activ": False,
+                "pret_max": pret_mediu, "pret_min": pret_mediu,
+                "trailing_activ": False,
             }
             mesaje.append(f"➕ {simbol}: pozitie la broker, absenta local — adoptata "
                           f"({qty} @ ${pret_mediu:.2f})")
@@ -885,7 +936,7 @@ def ruleaza():
                         pret_exec, qty_exec = executie_stop
                         profit = (pret_exec - poz["pret_intrare"]) * qty_exec
                         log_tranzactie(memorie, simbol, "close_long", pret_exec,
-                                       qty_exec, profit, "STOP LOSS (broker)")
+                                       qty_exec, profit, "STOP LOSS (broker)", poz)
                         print(f"  🔴 {simbol}: inchis de stopul de la broker "
                               f"@ ${pret_exec:.2f} | ${profit:.2f}")
                         del pozitii[simbol]
@@ -898,7 +949,7 @@ def ruleaza():
                         pret_exec, qty_exec = executie
                         profit = (pret_exec - poz["pret_intrare"]) * qty_exec
                         log_tranzactie(memorie, simbol, "close_long", pret_exec,
-                                       qty_exec, profit, "END OF DAY")
+                                       qty_exec, profit, "END OF DAY", poz)
                         emoji = "🟢" if profit >= 0 else "🔴"
                         print(f"  {emoji} {simbol} inchis EOD: ${profit:.2f}")
                         if qty_exec < poz["cantitate"]:
@@ -943,7 +994,7 @@ def ruleaza():
                             pret_exec, qty_exec = executie_stop
                             profit = (pret_exec - poz["pret_intrare"]) * qty_exec
                             log_tranzactie(memorie, simbol, "close_long", pret_exec,
-                                           qty_exec, profit, "STOP LOSS (broker)")
+                                           qty_exec, profit, "STOP LOSS (broker)", poz)
                             print(f"  🔴 IESIRE {simbol}: stopul de la broker a "
                                   f"prins-o primul @ ${pret_exec:.2f} | ${profit:.2f}")
                             del pozitii[simbol]
@@ -958,7 +1009,7 @@ def ruleaza():
                             pret_exec, qty_exec = executie
                             profit = (pret_exec - poz["pret_intrare"]) * qty_exec
                             log_tranzactie(memorie, simbol, "close_long", pret_exec,
-                                           qty_exec, profit, motiv)
+                                           qty_exec, profit, motiv, poz)
                             emoji = "🟢" if profit >= 0 else "🔴"
                             print(f"  {emoji} IESIRE {simbol}: {motiv} | ${profit:.2f}")
                             if qty_exec < poz["cantitate"]:
@@ -1008,7 +1059,9 @@ def ruleaza():
                                 pret_exec, qty_exec = executie
                                 pozitii[simbol] = {
                                     "pret_intrare": pret_exec, "cantitate": qty_exec,
-                                    "pret_max": pret_exec, "trailing_activ": False,
+                                    "pret_max": pret_exec, "pret_min": pret_exec,
+                                    "ora_intrare": acum_ny().isoformat(),
+                                    "trailing_activ": False,
                                     "stop_loss_pct": stop_loss_pct
                                 }
                                 log_tranzactie(memorie, simbol, "open_long", pret_exec,
