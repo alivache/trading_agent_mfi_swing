@@ -246,6 +246,39 @@ def test_stopul_nu_coboara_sub_minim(monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────
+# Limita de corelatie pe cluster
+# ─────────────────────────────────────────────────────────────
+def test_simbol_neincadrat_nu_e_blocat_niciodata():
+    pozitii = {"NVDA": poz(), "AMD": poz(), "MU": poz()}
+    assert m.cluster_pentru("CSCO") is None
+    assert m.cluster_plin(pozitii, "CSCO") is False
+
+
+def test_clusterul_gol_permite_intrarea():
+    assert m.cluster_plin({}, "NVDA") is False
+
+
+def test_clusterul_sub_limita_permite_intrarea():
+    assert m.cluster_plin({"NVDA": poz()}, "AMD") is False
+
+
+def test_clusterul_la_limita_blocheaza_intrarea():
+    assert m.cluster_plin({"NVDA": poz(), "AMD": poz()}, "MU") is True
+
+
+def test_pozitiile_din_alt_cluster_nu_blocheaza():
+    """Trei megacap deschise nu trebuie sa inchida usa semiconductoarelor."""
+    pozitii = {"AAPL": poz(), "MSFT": poz(), "META": poz()}
+    assert m.cluster_plin(pozitii, "NVDA") is False
+
+
+def test_clusterele_nu_se_suprapun():
+    """Un simbol intr-un singur cluster — altfel cluster_pentru ar fi ambigua."""
+    membri = [s for grup in m.CLUSTERE.values() for s in grup]
+    assert len(membri) == len(set(membri))
+
+
+# ─────────────────────────────────────────────────────────────
 # Indicatori
 # ─────────────────────────────────────────────────────────────
 def test_ema_pe_serie_constanta_este_constanta():

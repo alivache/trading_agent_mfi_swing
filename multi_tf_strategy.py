@@ -65,6 +65,7 @@ for parte in EARNINGS_RAW.split(","):
 # ─────────────────────────────────────────────────────────────
 SCAN_INTERVAL_SEC = 60
 MAX_POZITII = 5
+MAX_POZITII_CLUSTER = 2             # maxim 2 pozitii simultane din acelasi cluster
 RISC_PORTOFOLIU_PCT = 0.01          # 1% risc pe portofoliu
 STOP_LOSS_MIN_PCT = 0.015           # stop loss minim 1.5%
 STOP_LOSS_PCT = 0.015               # stop loss fix -1.5%
@@ -83,6 +84,19 @@ CACHE_GRAFICE_CICLURI = 5           # scrie cache grafice la fiecare 5 cicluri (
 CACHE_GRAFICE_CICLURI_INCHIS = 10   # la fiecare 10 cand bursa e inchisa
 ORDIN_TIMEOUT_SEC = 20              # cat asteptam executia unui ordin market
 ORDIN_POLL_SEC = 1                  # interval de interogare a starii ordinului
+
+# Grupuri de simboluri care se misca impreuna. Filtrul 1D lasa sa treaca
+# aproape numai semiconductoare, asa ca cele MAX_POZITII sloturi ajungeau sa fie
+# un singur pariu pe sector: pe 28 iul - 14 aug, cele 29 de tranzactii semi au dat
+# -170.85 USD, iar cele 17 din afara clusterului +27.20. Aceleasi nume tranzactionate
+# izolat (fara alta semi deschisa) au dat +44.03 pe 5 tranzactii.
+# Simbolurile care nu apar aici nu sunt restrictionate — dar oricum nu pot avea
+# decat o pozitie fiecare, deci nu se poate acumula risc redundant prin ele.
+CLUSTERE = {
+    "semi": {"NVDA", "AMD", "AVGO", "INTC", "MU", "AMAT", "TXN", "QCOM"},
+    "megacap": {"AAPL", "MSFT", "GOOGL", "AMZN", "META", "NFLX", "TSLA"},
+    "software": {"CRM", "ADBE", "ORCL", "PYPL"},
+}
 
 # Fisiere de stare
 POZITII_FILE = os.path.join(FOLDER, "pozitii_active.json")
@@ -375,6 +389,27 @@ def log_tranzactie(memorie, simbol, tip, pret, cantitate, profit=None, motiv=Non
 # ═════════════════════════════════════════════════════════════
 # FILTRE
 # ═════════════════════════════════════════════════════════════
+def cluster_pentru(simbol):
+    """Clusterul din care face parte simbolul, sau None daca e neincadrat."""
+    for nume, membri in CLUSTERE.items():
+        if simbol in membri:
+            return nume
+    return None
+
+
+def cluster_plin(pozitii, simbol):
+    """True daca clusterul simbolului are deja MAX_POZITII_CLUSTER pozitii deschise.
+
+    Functie pura. Un simbol neincadrat nu e niciodata blocat: nu poate avea
+    decat o pozitie, deci nu concentreaza risc.
+    """
+    grup = cluster_pentru(simbol)
+    if grup is None:
+        return False
+    deschise = sum(1 for s in pozitii if cluster_pentru(s) == grup)
+    return deschise >= MAX_POZITII_CLUSTER
+
+
 def seteaza_cooldown(memorie, simbol, durata):
     """Blocheaza reintrarea pe simbol pana la un moment dat (ora NY)."""
     memorie["cooldown"][simbol] = (acum_ny() + durata).isoformat()
@@ -779,6 +814,8 @@ def afiseaza_config():
           f"Trailing={TRAILING_DISTANTA_PCT*100:.1f}% (activ la {TRAILING_ACTIVARE_PCT*100:.1f}%)")
     print(f"🎯 15m: pullback<2.0% | RSI 25-60")
     print(f"📅 Blocare earnings: {EARNINGS_BLOCARE_ZILE} zi | Manual: {len(EARNINGS_MANUAL)} simboluri")
+    print(f"🧩 Max {MAX_POZITII} pozitii, din care max {MAX_POZITII_CLUSTER} pe cluster "
+          f"({', '.join(CLUSTERE)})")
     print(f"🔔 Inchidere: {INCHIDERE_MIN_INAINTE} min inainte | Stop intrari: {STOP_INTRARI_ORE_INAINTE}h inainte")
     print(f"⏱️  Scanare la fiecare {SCAN_INTERVAL_SEC}s | Cache grafice la {CACHE_GRAFICE_CICLURI} cicluri")
     print(f"📋 {len(ACTIUNI)} actiuni: {', '.join(ACTIUNI[:10])}{'...' if len(ACTIUNI) > 10 else ''}")
@@ -1037,6 +1074,10 @@ def ruleaza():
                     if len(pozitii) >= MAX_POZITII or trades_azi >= MAX_TRADES_PER_DAY:
                         break
                     if simbol in pozitii:
+                        continue
+                    if cluster_plin(pozitii, simbol):
+                        print(f"  ⏳ {simbol}: cluster {cluster_pentru(simbol)} plin "
+                              f"({MAX_POZITII_CLUSTER}/{MAX_POZITII_CLUSTER})")
                         continue
                     if in_cooldown(memorie, simbol):
                         print(f"  ⏳ {simbol}: cooldown activ")
