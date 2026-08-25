@@ -56,7 +56,7 @@ cp .env.example .env
 nano .env
 
 # 3. Instaleaza dependentele (foloseste venv-ul existent sau creeaza unul)
-~/trading/venv/bin/pip install -r requirements.txt
+~/trading-v3/venv/bin/pip install -r requirements.txt
 
 # 4. Instaleaza serviciile
 sudo cp trading.service /etc/systemd/system/trading-v3.service
