@@ -61,6 +61,8 @@ nano .env
 # 4. Instaleaza serviciile
 sudo cp trading.service /etc/systemd/system/trading-v3.service
 sudo cp dashboard.service /etc/systemd/system/dashboard-v3.service
+sudo cp vwap-shadow.service /etc/systemd/system/vwap-shadow.service
+sudo cp ofi-vwap-shadow.service /etc/systemd/system/ofi-vwap-shadow.service
 sudo systemctl daemon-reload
 ```
 
@@ -95,10 +97,14 @@ journalctl -u ofi-vwap-shadow.service -f
 # Pornire
 sudo systemctl start trading-v3.service
 sudo systemctl start dashboard-v3.service
+sudo systemctl start vwap-shadow.service
+sudo systemctl start ofi-vwap-shadow.service
 
 # Pornire automata la boot
 sudo systemctl enable trading-v3.service
 sudo systemctl enable dashboard-v3.service
+sudo systemctl enable vwap-shadow.service
+sudo systemctl enable ofi-vwap-shadow.service
 
 # Oprire
 sudo systemctl stop trading-v3.service
