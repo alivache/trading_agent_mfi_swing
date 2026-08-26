@@ -77,6 +77,18 @@ journalctl -u vwap-shadow.service -f
 
 State-ul pentru deduplicarea semnalelor este in `vwap_shadow_state.json`.
 
+## OFI + VWAP — shadow mode
+
+`ofi-vwap-shadow.service` asculta quote-uri Alpaca IEX, calculeaza OFI real
+pe minute si cere confirmarea VWAP Pullback. Nu trimite ordine. Barele OFI
+sunt scrise in `ofi_shadow_bars.csv`, iar semnalele confirmate in
+`ofi_vwap_shadow_signals.csv`.
+
+```bash
+systemctl status ofi-vwap-shadow.service --no-pager
+journalctl -u ofi-vwap-shadow.service -f
+```
+
 ## Pornire / Oprire / Restart
 
 ```bash
