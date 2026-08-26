@@ -59,6 +59,75 @@ def ultimele_linii_log(n=30):
         return []
 
 
+def pozitii_broker():
+    """P&L-ul nerealizat, direct de la broker. Gol daca API-ul nu raspunde."""
+    if _api is None:
+        return {}
+    try:
+        return {p.symbol: {"pret_curent": float(p.current_price),
+                           "profit": float(p.unrealized_pl),
+                           "profit_pct": float(p.unrealized_plpc) * 100}
+                for p in _api.list_positions()}
+    except Exception:
+        return {}
+
+
+def pret_din_cache(grafice, simbol):
+    inchideri = (grafice.get(simbol) or {}).get("close") or []
+    return inchideri[-1] if inchideri else None
+
+
+def pnl_pozitii(pozitii, grafice):
+    """P&L nerealizat per simbol, la momentul afisarii.
+
+    Sursa preferata e brokerul. Cand nu raspunde, cadem pe ultimul close din cache-ul de
+    grafice — pret intarziat, deci rezultatul e marcat ca aproximativ, nu dat drept exact.
+    """
+    broker = pozitii_broker()
+    rezultat = {}
+    for simbol, poz in pozitii.items():
+        date = broker.get(simbol)
+        aproximativ = date is None
+        if aproximativ:
+            pret = pret_din_cache(grafice, simbol)
+            intrare = poz.get("pret_intrare") or 0
+            if pret is None or not intrare:
+                continue
+            cantitate = poz.get("cantitate") or 0
+            date = {"pret_curent": pret, "profit": (pret - intrare) * cantitate,
+                    "profit_pct": (pret / intrare - 1) * 100}
+        rezultat[simbol] = {"pret_curent": round(date["pret_curent"], 2),
+                            "profit": round(date["profit"], 2),
+                            "profit_pct": round(date["profit_pct"], 2),
+                            "aproximativ": aproximativ}
+    return rezultat
+
+
+def adauga_rezultat_cumpararilor(tranzactii, pnl):
+    """Pune pe fiecare cumparare rezultatul ei la momentul afisarii.
+
+    Pozitie inca deschisa -> P&L nerealizat acum; pozitie deja inchisa azi -> profitul
+    realizat al vanzarii care i-a corespuns. Asteapta tranzactiile in ordine cronologica.
+    """
+    for t in tranzactii:
+        t["pnl_curent"], t["pnl_pct"], t["pnl_stare"] = None, None, None
+    deschise = {}
+    for t in tranzactii:
+        if t["tip"] == "open_long":
+            deschise[t["simbol"]] = t
+        elif t["tip"] == "close_long":
+            cumparare = deschise.pop(t["simbol"], None)
+            if cumparare is not None and t.get("profit") is not None:
+                cumparare["pnl_curent"], cumparare["pnl_stare"] = t["profit"], "inchis"
+    for simbol, cumparare in deschise.items():
+        date = pnl.get(simbol)
+        if date is not None:
+            cumparare["pnl_curent"] = date["profit"]
+            cumparare["pnl_pct"] = date["profit_pct"]
+            cumparare["pnl_stare"] = "aproximativ" if date["aproximativ"] else "deschis"
+    return tranzactii
+
+
 def calculeaza_statistici(memorie):
     tranzactii = memorie.get("tranzactii", [])
     inchideri = [t for t in tranzactii if t["tip"] == "close_long" and t.get("profit") is not None]
@@ -180,7 +249,18 @@ PAGINA = """
         <td>{% if t.tip=='open_long' %}<span class="badge" style="background:#1a3a1f;color:#3fb950;">BUY</span>{% else %}<span class="badge" style="background:#3a1a1a;color:#f85149;">SELL</span>{% endif %}</td>
         <td>${{ "%.2f"|format(t.pret) }}</td>
         <td>{{ t.cantitate }}</td>
-        <td>{% if t.profit is not none %}<span class="{{ 'verde' if t.profit>=0 else 'rosu' }}">${{ "%.2f"|format(t.profit) }}</span>{% else %}<span class="gri">—</span>{% endif %}</td>
+        <td>
+          {% if t.profit is not none %}
+            <span class="{{ 'verde' if t.profit>=0 else 'rosu' }}">${{ "%.2f"|format(t.profit) }}</span>
+          {% elif t.pnl_curent is not none %}
+            <span class="{{ 'verde' if t.pnl_curent>=0 else 'rosu' }}">{{ '~' if t.pnl_stare=='aproximativ' else '' }}${{ "%.2f"|format(t.pnl_curent) }}</span>
+            <span class="gri" style="font-size:11px;">
+              {%- if t.pnl_stare=='inchis' %}realizat
+              {%- else %}acum{% if t.pnl_pct is not none %} · {{ "%+.2f"|format(t.pnl_pct) }}%{% endif %}
+              {%- endif %}
+            </span>
+          {% else %}<span class="gri">—</span>{% endif %}
+        </td>
         <td class="gri">{{ t.motiv or '' }}</td>
       </tr>
       {% endfor %}
@@ -197,7 +277,17 @@ PAGINA = """
   {% if pozitii %}
   <div class="grafice">
     {% for sim, poz in pozitii.items() %}
-    <div class="grafic-box"><div id="chart_{{ sim }}" style="height:300px;"></div></div>
+    {% set p = pnl.get(sim) %}
+    <div class="grafic-box">
+      <div style="display:flex;justify-content:space-between;padding:4px 8px;">
+        <strong>{{ sim }}</strong>
+        <span class="gri">
+          {{ poz.cantitate }} × ${{ "%.2f"|format(poz.pret_intrare) }}
+          {% if p %}· <span class="{{ 'verde' if p.profit>=0 else 'rosu' }}">{{ '~' if p.aproximativ else '' }}${{ "%.2f"|format(p.profit) }} ({{ "%+.2f"|format(p.profit_pct) }}%)</span>{% endif %}
+        </span>
+      </div>
+      <div id="chart_{{ sim }}" style="height:300px;"></div>
+    </div>
     {% endfor %}
   </div>
   {% else %}<p class="gri">Nicio pozitie deschisa.</p>{% endif %}
@@ -332,12 +422,14 @@ def dashboard():
     tranzactii_azi = [t for t in memorie.get("tranzactii", []) if t["data"] == azi]
     profit_azi = sum(t["profit"] for t in tranzactii_azi
                      if t["tip"] == "close_long" and t.get("profit") is not None)
+    pnl = pnl_pozitii(pozitii, grafice)
+    adauga_rezultat_cumpararilor(tranzactii_azi, pnl)
     valoare, cash = get_cash_valoare()
     return render_template_string(
         PAGINA, tab="dashboard", acum=acum_ny().strftime("%H:%M:%S"),
         status_bursa="🟢 Bursa deschisa" if _bursa_pare_deschisa(memorie) else "🔴 Bursa inchisa",
         cash=cash, valoare=valoare, profit_azi=profit_azi, stats=stats,
-        pozitii=pozitii, tranzactii_azi=list(reversed(tranzactii_azi)),
+        pozitii=pozitii, tranzactii_azi=list(reversed(tranzactii_azi)), pnl=pnl,
         log_linii=ultimele_linii_log(30), grafice=grafice,
         grafice_json=json.dumps(grafice), pozitii_json=json.dumps(pozitii),
     )
@@ -351,7 +443,7 @@ def statistici():
         status_bursa="", stats=stats,
         pe_zi=stats_pe_zi(memorie), pe_simbol=stats_pe_simbol(memorie),
         pe_motiv=stats_pe_motiv(memorie),
-        pozitii={}, grafice={}, grafice_json="{}", pozitii_json="{}",
+        pozitii={}, grafice={}, grafice_json="{}", pozitii_json="{}", pnl={},
         cash=0, valoare=0, profit_azi=0, tranzactii_azi=[], log_linii=[],
     )
 
