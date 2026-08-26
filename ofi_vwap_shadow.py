@@ -47,16 +47,24 @@ def ratio_ofi(ofi, bid_volume, ask_volume):
 
 
 def minutul_quote(quote):
+    """Floors the quote timestamp to the New York minute.
+
+    Alpaca trimite Timestamp-uri pandas cu precizie de nanosecunda, iar `replace(microsecond=0)`
+    nu atinge campul `nanosecond`: fiecare quote primea propriul bucket, deci agregarea pe minut
+    nu se intampla deloc. Construim un datetime curat din campurile calendaristice.
+    """
     timestamp = getattr(quote, "timestamp", None)
     if timestamp is None:
         timestamp = datetime.now(timezone.utc)
-    return timestamp.astimezone(NY_TZ).replace(second=0, microsecond=0)
+    local = timestamp.astimezone(NY_TZ)
+    return datetime(local.year, local.month, local.day, local.hour, local.minute, tzinfo=NY_TZ)
 
 
 class OfiAggregator:
     def __init__(self):
         self.previous = {}
         self.bars = defaultdict(self._new_bar)
+        self.inchise = {}
 
     @staticmethod
     def _new_bar():
@@ -64,6 +72,9 @@ class OfiAggregator:
 
     def update(self, symbol, quote):
         bucket = minutul_quote(quote)
+        ultima_inchisa = self.inchise.get(symbol)
+        if ultima_inchisa is not None and bucket <= ultima_inchisa:
+            return ultima_inchisa  # quote intarziat: bara lui e deja scrisa, n-o redeschidem
         key = (symbol, bucket)
         flow, state = contributie_ofi(self.previous.get(symbol), quote)
         self.previous[symbol] = state
@@ -84,7 +95,11 @@ class OfiAggregator:
         memory — never written, never evaluated.
         """
         vechi = [key for key in self.bars if key[1] < curent]
-        return [(symbol, bucket, self.bars.pop((symbol, bucket))) for symbol, bucket in vechi]
+        expirate = []
+        for symbol, bucket in vechi:
+            self.inchise[symbol] = max(bucket, self.inchise.get(symbol, bucket))
+            expirate.append((symbol, bucket, self.bars.pop((symbol, bucket))))
+        return expirate
 
 
 def scrie_rand(path, fields, rand):

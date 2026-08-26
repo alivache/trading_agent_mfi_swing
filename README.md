@@ -105,6 +105,11 @@ de ce (`quote-uri insuficiente` sub `OFI_MIN_QUOTES`, `ofi sub prag` sub `OFI_MI
 de "a fost filtrat", deci nu se puteau calibra pragurile. Daca schema CSV-ului se schimba,
 fisierul vechi e rotit in `.bak` si se scrie unul nou cu antetul curent.
 
+Agregarea pe minut a fost reparata: timestamp-urile Alpaca au precizie de nanosecunda,
+iar `replace(microsecond=0)` nu atinge campul `nanosecond`, deci fiecare quote primea
+propriul bucket si nu se agrega nimic. De aceea aproape toate barele cadeau sub
+`OFI_MIN_QUOTES` si serviciul parea mut.
+
 Barele se inchid pe baza timpului, pe toate simbolurile — nu doar pe cel care tocmai a
 primit un quote — altfel barele simbolurilor tacute ramaneau blocate in memorie, nescrise
 si neevaluate. Confirmarea VWAP (apel HTTP blocant) ruleaza pe un thread separat, ca sa nu

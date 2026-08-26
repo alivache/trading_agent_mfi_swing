@@ -74,3 +74,29 @@ def test_csv_ul_se_roteste_cand_se_schimba_schema(tmp_path, monkeypatch):
     proceseaza_bar(None, "AAPL", bucket, {"ofi": 1.0, "bid_volume": 1.0, "ask_volume": 1.0, "quotes": 1})
     assert (tmp_path / "bars.csv.bak").exists()
     assert path.read_text(encoding="utf-8").splitlines()[0] == ",".join(module.OFI_FIELDS)
+
+
+def quote_cu_nanosecunde(nanosecunde, minute=0):
+    import pandas as pd
+
+    moment = pd.Timestamp(2026, 8, 26, 13, minute, tz="UTC") + pd.Timedelta(nanosecunde, unit="ns")
+    return SimpleNamespace(bid_price=100, ask_price=100.1, bid_size=10, ask_size=10,
+                           symbol="AAPL", timestamp=moment)
+
+
+def test_nanosecundele_nu_creeaza_bucket_uri_separate():
+    aggregator = OfiAggregator()
+    primul = aggregator.update("AAPL", quote_cu_nanosecunde(146))
+    al_doilea = aggregator.update("AAPL", quote_cu_nanosecunde(999))
+    assert primul == al_doilea
+    assert len(aggregator.bars) == 1
+    assert aggregator.bars[("AAPL", primul)]["quotes"] == 2
+
+
+def test_quote_intarziat_nu_redeschide_o_bara_scrisa():
+    aggregator = OfiAggregator()
+    aggregator.update("AAPL", quote(100, 100.1, 10, 10, 0))
+    curent = aggregator.update("AAPL", quote(100, 100.1, 10, 10, 1))
+    assert len(aggregator.expira(curent)) == 1
+    aggregator.update("AAPL", quote(100, 100.1, 10, 10, 0))
+    assert not any(bucket.minute == 0 for _, bucket in aggregator.bars)
