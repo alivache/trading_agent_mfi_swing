@@ -64,6 +64,19 @@ sudo cp dashboard.service /etc/systemd/system/dashboard-v3.service
 sudo systemctl daemon-reload
 ```
 
+## VWAP Pullback — shadow mode
+
+Scannerul `vwap-shadow.service` calculeaza VWAP pe bare de 5 minute si scrie
+semnalele confirmate in `vwap_shadow_signals.csv`, fara sa trimita ordine.
+Pentru status si log:
+
+```bash
+systemctl status vwap-shadow.service --no-pager
+journalctl -u vwap-shadow.service -f
+```
+
+State-ul pentru deduplicarea semnalelor este in `vwap_shadow_state.json`.
+
 ## Pornire / Oprire / Restart
 
 ```bash
