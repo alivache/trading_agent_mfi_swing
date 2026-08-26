@@ -1,0 +1,3 @@
+# Proiectul ruleaza pe Linux: fisierele raman cu LF, altfel unit-urile systemd
+# si shebang-urile ajung pe VM cu CR si nu mai pornesc.
+* text=auto eol=lf

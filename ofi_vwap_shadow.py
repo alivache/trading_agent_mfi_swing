@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """OFI + VWAP shadow scanner. Never submits broker orders."""
+import asyncio
 import csv
 import os
 from collections import defaultdict
@@ -15,6 +16,9 @@ FOLDER = os.path.dirname(os.path.abspath(__file__))
 NY_TZ = ZoneInfo("America/New_York")
 SIGNALS_FILE = os.path.join(FOLDER, "ofi_vwap_shadow_signals.csv")
 OFI_FILE = os.path.join(FOLDER, "ofi_shadow_bars.csv")
+OFI_FIELDS = ["timestamp", "simbol", "ofi", "bid_volume", "ask_volume", "quotes", "ofi_ratio", "motiv"]
+
+load_dotenv(os.path.join(FOLDER, ".env"))
 OFI_MIN_RATIO = float(os.getenv("OFI_MIN_RATIO", "0.25"))
 MIN_QUOTES = int(os.getenv("OFI_MIN_QUOTES", "10"))
 
@@ -73,42 +77,62 @@ class OfiAggregator:
     def finalize(self, symbol, bucket):
         return self.bars.pop((symbol, bucket), None)
 
+    def expira(self, curent):
+        """Closes every bar older than the current minute, on all symbols.
 
-def scrie_bar_ofi(symbol, bucket, bar):
-    exists = os.path.exists(OFI_FILE)
-    with open(OFI_FILE, "a", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=["timestamp", "simbol", "ofi", "bid_volume", "ask_volume", "quotes", "ofi_ratio"])
-        if not exists:
-            writer.writeheader()
-        writer.writerow({"timestamp": bucket.isoformat(), "simbol": symbol, **bar,
-                         "ofi_ratio": round(ratio_ofi(bar["ofi"], bar["bid_volume"], bar["ask_volume"]), 6)})
+        Flushing only the symbol that just ticked left quiet symbols' bars stranded in
+        memory — never written, never evaluated.
+        """
+        vechi = [key for key in self.bars if key[1] < curent]
+        return [(symbol, bucket, self.bars.pop((symbol, bucket))) for symbol, bucket in vechi]
 
 
-def proceseaza_bar(api, symbol, bucket, bar):
-    if bar is None or bar["quotes"] < MIN_QUOTES:
-        return False
-    ofi_ratio = ratio_ofi(bar["ofi"], bar["bid_volume"], bar["ask_volume"])
-    scrie_bar_ofi(symbol, bucket, bar)
-    if ofi_ratio < OFI_MIN_RATIO:
-        return False
-    data = descarca_bare(api, symbol)
-    ok, _, details = analizeaza_pullback(data)
-    if not ok:
-        return False
-    exists = os.path.exists(SIGNALS_FILE)
-    with open(SIGNALS_FILE, "a", newline="", encoding="utf-8") as file:
-        fields = ["timestamp", "simbol", "ofi_ratio", *details.keys()]
+def scrie_rand(path, fields, rand):
+    """Appends one row, rotating the file when its header no longer matches the schema."""
+    if os.path.exists(path):
+        with open(path, newline="", encoding="utf-8") as file:
+            if next(csv.reader(file), None) != fields:
+                os.replace(path, path + ".bak")
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
         if not exists:
             writer.writeheader()
-        writer.writerow({"timestamp": bucket.isoformat(), "simbol": symbol,
-                         "ofi_ratio": round(ofi_ratio, 6), **details})
+        writer.writerow(rand)
+
+
+def scrie_bar_ofi(symbol, bucket, bar, ofi_ratio, motiv):
+    scrie_rand(OFI_FILE, OFI_FIELDS, {"timestamp": bucket.isoformat(), "simbol": symbol, **bar,
+                                      "ofi_ratio": round(ofi_ratio, 6), "motiv": motiv})
+
+
+def proceseaza_bar(api, symbol, bucket, bar, acum=None):
+    if bar is None:
+        return False
+    ofi_ratio = ratio_ofi(bar["ofi"], bar["bid_volume"], bar["ask_volume"])
+    if bar["quotes"] < MIN_QUOTES:
+        motiv = "quote-uri insuficiente"
+    elif ofi_ratio < OFI_MIN_RATIO:
+        motiv = "ofi sub prag"
+    else:
+        motiv = "candidat"
+    # Toate barele se scriu, inclusiv cele respinse: altfel nu se poate distinge
+    # "n-au fost date" de "a fost filtrat" si pragurile nu se pot calibra.
+    scrie_bar_ofi(symbol, bucket, bar, ofi_ratio, motiv)
+    if motiv != "candidat":
+        return False
+    data = descarca_bare(api, symbol)
+    ok, _, details, _ = analizeaza_pullback(data, acum)
+    if not ok:
+        return False
+    scrie_rand(SIGNALS_FILE, ["timestamp", "simbol", "ofi_ratio", *details.keys()],
+               {"timestamp": bucket.isoformat(), "simbol": symbol,
+                "ofi_ratio": round(ofi_ratio, 6), **details})
     print(f"OFI+VWAP SHADOW SIGNAL {symbol}: ratio={ofi_ratio:.3f}", flush=True)
     return True
 
 
 def main():
-    load_dotenv(os.path.join(FOLDER, ".env"))
     api = tradeapi.REST(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_SECRET_KEY"),
                         os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"), api_version="v2")
     stream = tradeapi.Stream(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_SECRET_KEY"),
@@ -116,12 +140,13 @@ def main():
     aggregator = OfiAggregator()
 
     async def on_quote(quote):
-        symbol = quote.symbol
-        current = aggregator.update(symbol, quote)
-        for key in list(aggregator.bars):
-            if key[0] == symbol and key[1] < current:
-                old_bucket = key[1]
-                proceseaza_bar(api, symbol, old_bucket, aggregator.finalize(symbol, old_bucket))
+        try:
+            current = aggregator.update(quote.symbol, quote)
+            for symbol, bucket, bar in aggregator.expira(current):
+                # descarca_bare face HTTP blocant: pe event-loop ar opri stream-ul de quote-uri.
+                await asyncio.to_thread(proceseaza_bar, api, symbol, bucket, bar)
+        except Exception as error:
+            print(f"Eroare OFI shadow: {error}", flush=True)
 
     stream.subscribe_quotes(on_quote, *ACTIUNI)
     print(f"OFI + VWAP SHADOW | {len(ACTIUNI)} simboluri | feed IEX", flush=True)

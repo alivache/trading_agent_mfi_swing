@@ -70,6 +70,19 @@ sudo systemctl daemon-reload
 
 Scannerul `vwap-shadow.service` calculeaza VWAP pe bare de 5 minute si scrie
 semnalele confirmate in `vwap_shadow_signals.csv`, fara sa trimita ordine.
+
+Analiza se face **doar pe ultima bara incheiata din sesiunea regulara** (09:30-16:00 NY):
+
+- barele de pre-market si after-hours sunt excluse — pe IEX sunt subtiri si ancorau VWAP-ul
+  de sesiune pe cateva print-uri cu volum aproape nul, ceea ce facea ca orice bara de dupa
+  deschidere sa para pullback;
+- bara in formare e taiata (`VWAP_DURATA_BARA_MIN`, 5) — inainte `Close` si `Volume` se mai
+  schimbau dupa ce semnalul era deja scris;
+- barele mai vechi de `VWAP_VECHIME_MAXIMA_MIN` (15) sunt respinse cu `bara invechita`, ca sa
+  nu se mai emita semnale pe ultima bara de ieri cand la deschidere nu exista inca date de azi;
+- primele `VWAP_WARMUP_MIN` (30) minute de sesiune sunt sarite: `VolumeMA20` acopera acolo
+  barele de peste noapte, deci filtrul de volum trecea automat.
+
 Pentru status si log:
 
 ```bash
@@ -85,6 +98,21 @@ State-ul pentru deduplicarea semnalelor este in `vwap_shadow_state.json`.
 pe minute si cere confirmarea VWAP Pullback. Nu trimite ordine. Barele OFI
 sunt scrise in `ofi_shadow_bars.csv`, iar semnalele confirmate in
 `ofi_vwap_shadow_signals.csv`.
+
+**Toate** barele se scriu in `ofi_shadow_bars.csv`, si cele respinse — coloana `motiv` spune
+de ce (`quote-uri insuficiente` sub `OFI_MIN_QUOTES`, `ofi sub prag` sub `OFI_MIN_RATIO`,
+`candidat` daca s-a cerut confirmarea VWAP). Fara asta nu se putea distinge "n-au fost date"
+de "a fost filtrat", deci nu se puteau calibra pragurile. Daca schema CSV-ului se schimba,
+fisierul vechi e rotit in `.bak` si se scrie unul nou cu antetul curent.
+
+Barele se inchid pe baza timpului, pe toate simbolurile — nu doar pe cel care tocmai a
+primit un quote — altfel barele simbolurilor tacute ramaneau blocate in memorie, nescrise
+si neevaluate. Confirmarea VWAP (apel HTTP blocant) ruleaza pe un thread separat, ca sa nu
+opreasca stream-ul de quote-uri.
+
+Pe feed-ul IEX gratuit majoritatea simbolurilor nu ating 10 quote-uri pe minut, asa ca
+`OFI_MIN_QUOTES` si `OFI_MIN_RATIO` (0.25) trebuie recalibrate pe datele colectate — acum ca
+se scriu si barele respinse, distributia reala e vizibila in CSV.
 
 ```bash
 systemctl status ofi-vwap-shadow.service --no-pager

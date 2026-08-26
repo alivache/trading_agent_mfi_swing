@@ -5,7 +5,7 @@ import csv
 import json
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as ora_zi, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import alpaca_trade_api as tradeapi
@@ -25,6 +25,44 @@ ACTIUNI = [s.strip().upper() for s in os.getenv("ACTIUNI", "AAPL,MSFT,NVDA").spl
 SCAN_INTERVAL_SEC = int(os.getenv("VWAP_SHADOW_INTERVAL_SEC", "300"))
 PROXIMITATE_VWAP_PCT = float(os.getenv("VWAP_PROXIMITATE_PCT", "0.005"))
 VOLUM_MIN_MULTIPLIER = float(os.getenv("VWAP_VOLUM_MIN_MULTIPLIER", "1.2"))
+DURATA_BARA_MIN = int(os.getenv("VWAP_DURATA_BARA_MIN", "5"))
+VECHIME_MAXIMA_MIN = float(os.getenv("VWAP_VECHIME_MAXIMA_MIN", "15"))
+WARMUP_SESIUNE_MIN = float(os.getenv("VWAP_WARMUP_MIN", "30"))
+MIN_BARE = 50
+SESIUNE_START = ora_zi(9, 30)
+SESIUNE_STOP = ora_zi(16, 0)
+
+
+def index_utc(df):
+    """Normalizes the bar index to tz-aware UTC; Alpaca sometimes returns naive stamps."""
+    index = pd.DatetimeIndex(df.index)
+    return index.tz_localize(timezone.utc) if index.tz is None else index.tz_convert(timezone.utc)
+
+
+def doar_sesiune_regulara(df):
+    """Keeps only 09:30-16:00 NY bars.
+
+    Pre-market bars on IEX are thin and would anchor the session VWAP on a handful of
+    near-zero-volume prints, which made every bar right after the open look like a pullback.
+    """
+    if df.empty:
+        return df
+    local = index_utc(df).tz_convert(NY_TZ)
+    return df[(local.time >= SESIUNE_START) & (local.time < SESIUNE_STOP)]
+
+
+def elimina_bara_incompleta(df, acum):
+    """Drops the still-forming bar — its Close and Volume keep changing after we read them."""
+    if df.empty:
+        return df
+    if index_utc(df)[-1] + timedelta(minutes=DURATA_BARA_MIN) > acum:
+        return df.iloc[:-1]
+    return df
+
+
+def minute_de_la_deschidere(moment):
+    local = moment.astimezone(NY_TZ)
+    return (local.hour - SESIUNE_START.hour) * 60 + local.minute - SESIUNE_START.minute
 
 
 def calculeaza_vwap(df):
@@ -32,10 +70,7 @@ def calculeaza_vwap(df):
     if df.empty:
         return pd.Series(dtype=float, index=df.index)
     prices = (df["High"] + df["Low"] + df["Close"]) / 3
-    index = pd.DatetimeIndex(df.index)
-    if index.tz is None:
-        index = index.tz_localize(timezone.utc)
-    sessions = index.tz_convert(NY_TZ).date
+    sessions = index_utc(df).tz_convert(NY_TZ).date
     volume = df["Volume"].astype(float).clip(lower=0)
     value = prices * volume
     return value.groupby(sessions).cumsum() / volume.groupby(sessions).cumsum().replace(0, float("nan"))
@@ -51,14 +86,23 @@ def pregateste_bare(df):
     return result
 
 
-def analizeaza_pullback(df):
-    """Returns (accepted, reason, details) for the last completed bar."""
-    if df is None or len(df) < 50:
-        return False, "date insuficiente", {}
-    data = pregateste_bare(df)
+def analizeaza_pullback(df, acum=None):
+    """Returns (accepted, reason, details, bar_time) for the last completed session bar."""
+    if df is None or df.empty:
+        return False, "date insuficiente", {}, None
+    acum = acum or datetime.now(timezone.utc)
+    sesiune = elimina_bara_incompleta(doar_sesiune_regulara(df), acum)
+    if len(sesiune) < MIN_BARE:
+        return False, "date insuficiente", {}, None
+    bar_time = index_utc(sesiune)[-1]
+    if acum - bar_time > timedelta(minutes=VECHIME_MAXIMA_MIN):
+        return False, "bara invechita", {}, bar_time
+    if minute_de_la_deschidere(bar_time) < WARMUP_SESIUNE_MIN:
+        return False, "warm-up sesiune", {}, bar_time
+    data = pregateste_bare(sesiune)
     ultima = data.iloc[-1]
     if pd.isna(ultima[["VWAP", "EMA20", "EMA50", "VolumeMA20"]]).any():
-        return False, "indicatori insuficienti", {}
+        return False, "indicatori insuficienti", {}, bar_time
     proximity = abs(ultima["Close"] - ultima["VWAP"]) / ultima["VWAP"]
     volume_ok = ultima["Volume"] >= ultima["VolumeMA20"] * VOLUM_MIN_MULTIPLIER
     trend_ok = ultima["Close"] > ultima["VWAP"] and ultima["EMA20"] > ultima["EMA50"]
@@ -73,7 +117,7 @@ def analizeaza_pullback(df):
         "volume_ma20": round(float(ultima["VolumeMA20"]), 2),
         "proximity_pct": round(proximity * 100, 3),
     }
-    return accepted, "VWAP pullback confirmat" if accepted else "filtre neconfirmate", details
+    return accepted, "VWAP pullback confirmat" if accepted else "filtre neconfirmate", details, bar_time
 
 
 def incarca_stare():
@@ -118,11 +162,12 @@ def descarca_bare(api, simbol):
 
 def ruleaza_scanare(api, simboluri):
     semnale = 0
+    acum = datetime.now(timezone.utc)
     for simbol in simboluri:
         try:
             df = descarca_bare(api, simbol)
-            ok, motiv, details = analizeaza_pullback(df)
-            if ok and scrie_semnal(simbol, df.index[-1], details):
+            ok, motiv, details, bar_time = analizeaza_pullback(df, acum)
+            if ok and scrie_semnal(simbol, bar_time, details):
                 print(f"SHADOW SIGNAL {simbol}: {motiv} | {details}", flush=True)
                 semnale += 1
         except Exception as error:
