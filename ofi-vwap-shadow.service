@@ -2,6 +2,9 @@
 Description=OFI plus VWAP Shadow Scanner (no orders)
 After=network-online.target
 Wants=network-online.target
+# Garda anti-furtuna iese cu cod 1 cand Alpaca refuza reconectarile; asta poate insemna mai
+# multe reporniri la rand, iar limita implicita (5 in 10s) ar opri unitul definitiv.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -9,7 +12,8 @@ User=ubuntu
 WorkingDirectory=/home/ubuntu/trading-v3
 ExecStart=/home/ubuntu/trading-v3/venv/bin/python /home/ubuntu/trading-v3/ofi_vwap_shadow.py
 Restart=always
-RestartSec=10
+# 30s, nu 10s: brokerul are nevoie de timp sa elibereze conexiunile ramase de la procesul mort.
+RestartSec=30
 
 [Install]
 WantedBy=multi-user.target
