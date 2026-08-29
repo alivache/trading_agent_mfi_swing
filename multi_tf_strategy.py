@@ -67,7 +67,15 @@ SCAN_INTERVAL_SEC = 60
 MAX_POZITII = 5
 MAX_POZITII_CLUSTER = 2             # maxim 2 pozitii simultane din acelasi cluster
 RISC_PORTOFOLIU_PCT = 0.01          # 1% risc pe portofoliu
-STOP_LOSS_MIN_PCT = 0.015           # stop loss minim 1.5%
+# Coborat de la 1.5% pe 29 aug 2026. Pe cele 10 inchideri de pe VM-ul nou
+# (25-28 aug) MAE-ul separa curat rezultatele: niciun castigator n-a trecut
+# de -0.82%, in timp ce cele doua stop loss-uri au fost -1.48% si -1.52%.
+# O pozitie care merge peste ~0.9% impotriva nu s-a mai intors. Replay pe
+# acelasi esantion: stop 0.9% -> +3.64 USD (3 oprite) vs stop 1.5% -> -25.13.
+# Marimea pozitiei nu creste: notionalele reale (~2300 USD) sunt lipite de
+# MAX_TRADE_SIZE_USD, deci in calculeaza_cantitate leaga plafonul de marime,
+# nu cel de risc.
+STOP_LOSS_MIN_PCT = 0.009           # stop loss minim 0.9%
 STOP_LOSS_PCT = 0.015               # stop loss fix -1.5%
 TAKE_PROFIT_PCT = 0.04              # +4%
 TRAILING_ACTIVARE_PCT = 0.015       # trailing se activeaza la +1.5%
