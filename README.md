@@ -115,9 +115,18 @@ primit un quote — altfel barele simbolurilor tacute ramaneau blocate in memori
 si neevaluate. Confirmarea VWAP (apel HTTP blocant) ruleaza pe un thread separat, ca sa nu
 opreasca stream-ul de quote-uri.
 
-Pe feed-ul IEX gratuit majoritatea simbolurilor nu ating 10 quote-uri pe minut, asa ca
-`OFI_MIN_QUOTES` si `OFI_MIN_RATIO` (0.25) trebuie recalibrate pe datele colectate — acum ca
-se scriu si barele respinse, distributia reala e vizibila in CSV.
+Pragurile au fost recalibrate pe 6 septembrie 2026, pe 57.762 de bare eligibile colectate
+intre 26 august si 4 septembrie:
+
+- `OFI_MIN_QUOTES` (10) **nu mai e constrangerea** — dupa repararea agregarii pe minut,
+  mediana e 208 quote-uri/minut (p25=58), iar sub prag cad doar 988 de bare din ~60.000.
+- `OFI_MIN_RATIO` a coborat de la **0.25 la 0.08**. Distributia reala a lui `ofi_ratio` e
+  p90=+0.021, p95=+0.033, p99=+0.068, max=+0.539 — cvasi-simetrica in jurul lui zero, deci
+  fluxul de ordine pe IEX nu are directie persistenta. La 0.25 treceau 8 bare in 8 zile
+  (~1/zi pe 20 de simboluri) si nu s-a confirmat niciun semnal; la 0.08 trec ~45 de bare/zi.
+
+Comparatia se face pe valoarea **cu semn**, nu pe modul: doar presiunea de cumparare
+conteaza, fiind o strategie long-only.
 
 ```bash
 systemctl status ofi-vwap-shadow.service --no-pager

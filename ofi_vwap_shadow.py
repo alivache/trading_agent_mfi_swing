@@ -22,7 +22,13 @@ OFI_FILE = os.path.join(FOLDER, "ofi_shadow_bars.csv")
 OFI_FIELDS = ["timestamp", "simbol", "ofi", "bid_volume", "ask_volume", "quotes", "ofi_ratio", "motiv"]
 
 load_dotenv(os.path.join(FOLDER, ".env"))
-OFI_MIN_RATIO = float(os.getenv("OFI_MIN_RATIO", "0.25"))
+# Calibrat pe 57.762 de bare eligibile colectate intre 26 august si 4 septembrie 2026.
+# Pragul de 0.25 statea peste percentila 99.99 a lui `ofi_ratio`: 8 bare l-au trecut in
+# 8 zile (~1/zi pe 20 de simboluri), deci serviciul nu putea produce semnale. Distributia
+# reala e p90=+0.021, p95=+0.033, p99=+0.068, max=+0.539 — cvasi-simetrica in jurul lui 0,
+# adica OFI-ul pe IEX nu are directie persistenta. 0.08 selecteaza ~45 de bare/zi, destul
+# cat confirmarea VWAP sa aiba ce filtra fara sa inunde apelurile HTTP de confirmare.
+OFI_MIN_RATIO = float(os.getenv("OFI_MIN_RATIO", "0.08"))
 MIN_QUOTES = int(os.getenv("OFI_MIN_QUOTES", "10"))
 STREAM_ERORI_MAX = int(os.getenv("OFI_STREAM_ERORI_MAX", "20"))
 STREAM_FEREASTRA_SEC = float(os.getenv("OFI_STREAM_FEREASTRA_SEC", "60"))
