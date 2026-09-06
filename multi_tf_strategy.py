@@ -67,11 +67,21 @@ SCAN_INTERVAL_SEC = 60
 MAX_POZITII = 5
 MAX_POZITII_CLUSTER = 2             # maxim 2 pozitii simultane din acelasi cluster
 RISC_PORTOFOLIU_PCT = 0.01          # 1% risc pe portofoliu
-# Coborat de la 1.5% pe 29 aug 2026. Pe cele 10 inchideri de pe VM-ul nou
-# (25-28 aug) MAE-ul separa curat rezultatele: niciun castigator n-a trecut
-# de -0.82%, in timp ce cele doua stop loss-uri au fost -1.48% si -1.52%.
-# O pozitie care merge peste ~0.9% impotriva nu s-a mai intors. Replay pe
-# acelasi esantion: stop 0.9% -> +3.64 USD (3 oprite) vs stop 1.5% -> -25.13.
+# Coborat de la 1.5% pe 29 aug 2026, pe cele 10 inchideri de atunci (25-28 aug),
+# unde MAE-ul parea sa separe curat rezultatele: niciun castigator nu trecuse de
+# -0.82%, iar cele doua stop loss-uri fusesera -1.48% si -1.52%.
+#
+# Reverificat pe 6 sep 2026, pe toate cele 18 inchideri (25 aug - 4 sep):
+# premisa "o pozitie care merge peste ~0.9% impotriva nu se mai intoarce" e
+# infirmata — AMD (26 aug) a inchis la -0.68% dupa ce trecuse de -0.9%, iar MU
+# (3 sep) la +0.15% dupa un MAE de -1.43%. Pragul minim leaga pe toate cele 18
+# (1.5xATR pe 5m sta mereu sub el), dar doar 4 ies diferit: stopul strans taie
+# coada stanga (NVDA +14.05, AMZN +7.78) si cumpara whipsaw (MU -19.95,
+# AMD -5.37). Total: 0.9% -> +50.56 USD vs 1.5% -> +54.05 USD, adica -3.49 USD
+# pe 4 evenimente — zgomot, nu semnal. Pastram 0.9% pentru ca marginea e in
+# limita zgomotului iar plafonul de pierdere per tranzactie e mai mic; nu
+# pentru ca ar fi demonstrat mai bun. Replay: analiza_7z/sim_stop_all.py
+#
 # Marimea pozitiei nu creste: notionalele reale (~2300 USD) sunt lipite de
 # MAX_TRADE_SIZE_USD, deci in calculeaza_cantitate leaga plafonul de marime,
 # nu cel de risc.
