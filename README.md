@@ -128,6 +128,11 @@ intre 26 august si 4 septembrie:
 Comparatia se face pe valoarea **cu semn**, nu pe modul: doar presiunea de cumparare
 conteaza, fiind o strategie long-only.
 
+Semnalele sunt deduplicate pe bara de confirmare VWAP, in `ofi_vwap_shadow_state.json`:
+bara OFI e de un minut, cea VWAP de cinci, deci mai multe minute OFI cad pe aceeasi bara
+si scriau acelasi eveniment de mai multe ori (pe 9 septembrie 2026, doua din cele trei
+semnale erau acelasi). Numarul de semnale e criteriul pe care se judeca pragul OFI.
+
 ```bash
 systemctl status ofi-vwap-shadow.service --no-pager
 journalctl -u ofi-vwap-shadow.service -f

@@ -120,19 +120,20 @@ def analizeaza_pullback(df, acum=None):
     return accepted, "VWAP pullback confirmat" if accepted else "filtre neconfirmate", details, bar_time
 
 
-def incarca_stare():
+def incarca_stare(path=None):
     try:
-        with open(STATE_FILE, encoding="utf-8") as file:
+        with open(path or STATE_FILE, encoding="utf-8") as file:
             return json.load(file)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
-def salveaza_stare(state):
-    temporary = STATE_FILE + ".tmp"
+def salveaza_stare(state, path=None):
+    path = path or STATE_FILE
+    temporary = path + ".tmp"
     with open(temporary, "w", encoding="utf-8") as file:
         json.dump(state, file, indent=2)
-    os.replace(temporary, STATE_FILE)
+    os.replace(temporary, path)
 
 
 def scrie_semnal(simbol, bar_time, details):
@@ -182,9 +183,17 @@ def main():
     api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version="v2")
     print(f"VWAP PULLBACK SHADOW | {len(ACTIUNI)} simboluri | interval {SCAN_INTERVAL_SEC}s", flush=True)
     while True:
-        if api.get_clock().is_open:
+        # get_clock era singurul apel din bucla fara try/except: un APIError de la Alpaca
+        # termina procesul. Pe 11 septembrie 2026 asta a dat 194 de reporniri systemd
+        # intr-o ora de sesiune, fiecare repornire pierzand si pasul de scanare.
+        try:
+            deschisa = api.get_clock().is_open
+        except Exception as error:
+            print(f"Eroare clock Alpaca: {error} - reincercam", flush=True)
+            deschisa = None
+        if deschisa:
             ruleaza_scanare(api, ACTIUNI)
-        else:
+        elif deschisa is False:
             print("Bursa inchisa - shadow in asteptare", flush=True)
         if args.once:
             return

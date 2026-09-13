@@ -162,3 +162,46 @@ def test_garda_ignora_erorile_izolate_din_ferestre_diferite(monkeypatch):
         garda.emit(eroare_de_stream())
         ceas[0] += 61
     assert not iesiri
+
+
+def test_semnalul_nu_se_repeta_pe_aceeasi_bara_vwap(tmp_path, monkeypatch):
+    """Mai multe bare OFI de un minut cad pe aceeasi bara VWAP de cinci minute.
+
+    Pe 9 septembrie 2026 doua din cele trei semnale (TXN 14:29 si 14:33) erau
+    acelasi eveniment, scris de doua ori.
+    """
+    import ofi_vwap_shadow as module
+
+    monkeypatch.setattr(module, "OFI_FILE", str(tmp_path / "bare.csv"))
+    monkeypatch.setattr(module, "SIGNALS_FILE", str(tmp_path / "semnale.csv"))
+    monkeypatch.setattr(module, "STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setattr(module, "descarca_bare", lambda api, simbol: None)
+    monkeypatch.setattr(module, "analizeaza_pullback",
+                        lambda data, acum: (True, "ok", {"close": 260.83}, "bara-14:25"))
+
+    bar = {"ofi": 9.0, "bid_volume": 10.0, "ask_volume": 0.0, "quotes": 50}
+    primul = datetime(2026, 9, 9, 18, 29, tzinfo=timezone.utc)
+    al_doilea = datetime(2026, 9, 9, 18, 33, tzinfo=timezone.utc)
+
+    assert proceseaza_bar(None, "TXN", primul, dict(bar)) is True
+    assert proceseaza_bar(None, "TXN", al_doilea, dict(bar)) is False
+
+    randuri = (tmp_path / "semnale.csv").read_text(encoding="utf-8").splitlines()
+    assert len(randuri) == 2   # antet + un singur semnal
+
+
+def test_semnalul_reapare_pe_o_bara_vwap_noua(tmp_path, monkeypatch):
+    import ofi_vwap_shadow as module
+
+    monkeypatch.setattr(module, "OFI_FILE", str(tmp_path / "bare.csv"))
+    monkeypatch.setattr(module, "SIGNALS_FILE", str(tmp_path / "semnale.csv"))
+    monkeypatch.setattr(module, "STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setattr(module, "descarca_bare", lambda api, simbol: None)
+    bare_vwap = iter(["bara-14:25", "bara-14:30"])
+    monkeypatch.setattr(module, "analizeaza_pullback",
+                        lambda data, acum: (True, "ok", {"close": 260.83}, next(bare_vwap)))
+
+    bar = {"ofi": 9.0, "bid_volume": 10.0, "ask_volume": 0.0, "quotes": 50}
+    assert proceseaza_bar(None, "TXN", datetime(2026, 9, 9, 18, 29, tzinfo=timezone.utc), dict(bar))
+    assert proceseaza_bar(None, "TXN", datetime(2026, 9, 9, 18, 34, tzinfo=timezone.utc), dict(bar))
+    assert len((tmp_path / "semnale.csv").read_text(encoding="utf-8").splitlines()) == 3

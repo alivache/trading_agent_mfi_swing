@@ -13,11 +13,13 @@ import alpaca_trade_api as tradeapi
 from dotenv import load_dotenv
 
 from vwap_pullback_strategy import (ACTIUNI, SESIUNE_START, SESIUNE_STOP,
-                                    analizeaza_pullback, descarca_bare)
+                                    analizeaza_pullback, descarca_bare,
+                                    incarca_stare, salveaza_stare)
 
 FOLDER = os.path.dirname(os.path.abspath(__file__))
 NY_TZ = ZoneInfo("America/New_York")
 SIGNALS_FILE = os.path.join(FOLDER, "ofi_vwap_shadow_signals.csv")
+STATE_FILE = os.path.join(FOLDER, "ofi_vwap_shadow_state.json")
 OFI_FILE = os.path.join(FOLDER, "ofi_shadow_bars.csv")
 OFI_FIELDS = ["timestamp", "simbol", "ofi", "bid_volume", "ask_volume", "quotes", "ofi_ratio", "motiv"]
 
@@ -161,12 +163,22 @@ def proceseaza_bar(api, symbol, bucket, bar, acum=None):
     if motiv != "candidat":
         return False
     data = descarca_bare(api, symbol)
-    ok, _, details, _ = analizeaza_pullback(data, acum)
+    ok, _, details, bar_time = analizeaza_pullback(data, acum)
     if not ok:
+        return False
+    # Bara OFI e de un minut, cea a confirmarii VWAP de cinci: mai multe minute OFI
+    # cad pe aceeasi bara VWAP si scriau acelasi eveniment de mai multe ori. Pe 9
+    # septembrie 2026, doua din cele trei semnale (TXN 14:29 si 14:33) erau acelasi.
+    # Numarul de semnale e criteriul pe care se judeca pragul OFI, deci nu-l umflam.
+    stare = incarca_stare(STATE_FILE)
+    marcaj = str(bar_time)
+    if stare.get(symbol) == marcaj:
         return False
     scrie_rand(SIGNALS_FILE, ["timestamp", "simbol", "ofi_ratio", *details.keys()],
                {"timestamp": bucket.isoformat(), "simbol": symbol,
                 "ofi_ratio": round(ofi_ratio, 6), **details})
+    stare[symbol] = marcaj
+    salveaza_stare(stare, STATE_FILE)
     print(f"OFI+VWAP SHADOW SIGNAL {symbol}: ratio={ofi_ratio:.3f}", flush=True)
     return True
 

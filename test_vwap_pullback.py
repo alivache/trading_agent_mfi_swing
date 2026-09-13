@@ -1,4 +1,5 @@
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -110,3 +111,32 @@ def test_semnalul_se_deduplicateaza(tmp_path, monkeypatch):
     assert scrie_semnal("AAPL", "bar-1", {"close": 100})
     assert not scrie_semnal("AAPL", "bar-1", {"close": 100})
     assert len((tmp_path / "signals.csv").read_text().splitlines()) == 2
+
+
+def test_bucla_supravietuieste_erorii_de_clock(monkeypatch, capsys):
+    """Un APIError la get_clock nu mai termina procesul (11 sep 2026: 194 reporniri)."""
+    import vwap_pullback_strategy as module
+
+    def clock_stricat():
+        raise RuntimeError("Internal Server Error")
+
+    monkeypatch.setattr(module.tradeapi, "REST",
+                        lambda *a, **k: SimpleNamespace(get_clock=clock_stricat))
+    monkeypatch.setattr("sys.argv", ["vwap_pullback_strategy.py", "--once"])
+    apelat = []
+    monkeypatch.setattr(module, "ruleaza_scanare", lambda *a: apelat.append(a))
+
+    module.main()   # nu ridica
+
+    assert apelat == []
+    assert "Eroare clock Alpaca" in capsys.readouterr().out
+
+
+def test_starea_se_poate_tine_in_alt_fisier(tmp_path):
+    """incarca/salveaza_stare accepta o cale — scannerul OFI isi tine propriul state."""
+    import vwap_pullback_strategy as module
+
+    cale = str(tmp_path / "alt_state.json")
+    assert module.incarca_stare(cale) == {}
+    module.salveaza_stare({"TXN": "bar-9"}, cale)
+    assert module.incarca_stare(cale) == {"TXN": "bar-9"}
