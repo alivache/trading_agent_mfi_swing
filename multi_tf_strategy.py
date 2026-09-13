@@ -742,7 +742,7 @@ def genereaza_raport_csv(memorie, zi):
                  if t["data"] == zi and t["tip"] == "close_long"]
     if not inchideri:
         print(f"📊 Nicio inchidere pentru raport ({zi})")
-        return
+        return False
     with open(cale, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["data_iesire", "simbol", "cantitate", "pret_intrare",
@@ -770,6 +770,27 @@ def genereaza_raport_csv(memorie, zi):
                         t.get("mae_pct", ""), t.get("durata_min", ""),
                         t.get("motiv", ""), rezultat])
     print(f"📄 Raport generat: {cale} ({len(inchideri)} inchideri)")
+    return True
+
+
+def recupereaza_rapoarte_lipsa(memorie, azi):
+    """Scrie rapoartele zilelor incheiate care au inchideri dar n-au CSV.
+
+    Acopera gaura ramasa dupa rearmarea lui `raport_facut`: daca agentul e oprit
+    de dinainte de inchiderea sesiunii pana dupa miezul noptii, tranzitia
+    deschis->inchis nu e observata niciodata si ziua ar ramane fara raport.
+    Ziua curenta e sarita — pentru ea raportul se genereaza pe fluxul normal.
+    """
+    zile = sorted({t["data"] for t in memorie["tranzactii"]
+                   if t["tip"] == "close_long" and t["data"] < azi})
+    lipsa = [z for z in zile
+             if not os.path.exists(os.path.join(FOLDER, f"multitf_trades_{z}.csv"))]
+    if not lipsa:
+        return []
+    print(f"🧾 Recuperez {len(lipsa)} rapoarte lipsa: {', '.join(lipsa)}")
+    for z in lipsa:
+        genereaza_raport_csv(memorie, z)
+    return lipsa
 
 
 # ═════════════════════════════════════════════════════════════
@@ -924,12 +945,14 @@ def ruleaza():
     pozitii = incarca_pozitii()
     pozitii = reconciliaza_la_pornire(pozitii)
     memorie = incarca_memorie()
+    recupereaza_rapoarte_lipsa(memorie, acum_ny().strftime("%Y-%m-%d"))
 
     ciclu = 0
     zi_curenta = acum_ny().strftime("%Y-%m-%d")
     trades_azi = 0
     raport_facut = False
     inchidere_facuta = False
+    bursa_deschisa_anterior = None
 
     while True:
         try:
@@ -955,6 +978,13 @@ def ruleaza():
                 print(f"❌ Eroare clock Alpaca: {e}")
                 time.sleep(SCAN_INTERVAL_SEC)
                 continue
+
+            # Sesiunea tocmai s-a inchis: raportul generat premarket (pe o zi inca fara
+            # nicio inchidere) era gol si a consumat degeaba flagul. Il rearmam, altfel
+            # zilele in care toate iesirile au fost intraday raman fara CSV.
+            if bursa_deschisa_anterior and not bursa_deschisa:
+                raport_facut = False
+            bursa_deschisa_anterior = bursa_deschisa
 
             print(f"⏰ {acum.strftime('%H:%M:%S')} | Ciclu #{ciclu} | "
                   f"Trades: {trades_azi}/{MAX_TRADES_PER_DAY} | Pozitii: {len(pozitii)}/{MAX_POZITII}")

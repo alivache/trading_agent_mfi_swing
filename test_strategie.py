@@ -555,3 +555,66 @@ def test_cooldownul_nu_afecteaza_alte_simboluri():
     memorie = memorie_goala()
     m.log_tranzactie(memorie, "CSCO", "close_long", 115.52, 21, profit=1.26)
     assert m.in_cooldown(memorie, "AVGO") is False
+
+
+# ─────────────────────────────────────────────────────────────
+# Raportul CSV zilnic — zilele cu iesiri doar intraday
+#
+# Bug reparat pe 13 sep 2026: flagul `raport_facut` era consumat de trecerea
+# premarket a buclei (bursa inca inchisa, ziua fara nicio inchidere), iar dupa
+# inchiderea reala raportul nu se mai regenera. Singurul CSV scris era cel de pe
+# calea de inchidere fortata EOD, care ruleaza doar daca mai exista pozitii
+# deschise la 15:45 — deci zilele cu toate iesirile intraday ramaneau fara fisier
+# (28 aug, 1 sep, 8 sep 2026 lipseau).
+# ─────────────────────────────────────────────────────────────
+def _memorie_cu_inchidere(zi, simbol="MU", profit=-19.16):
+    return {
+        "tranzactii": [
+            {"simbol": simbol, "tip": "open_long", "pret": 1023.0, "cantitate": 2,
+             "profit": None, "motiv": "", "ora": "11:42:00", "data": zi},
+            {"simbol": simbol, "tip": "close_long", "pret": 1013.42, "cantitate": 2,
+             "profit": profit, "motiv": "STOP LOSS (broker)", "ora": "14:47:00",
+             "data": zi, "mfe_pct": 0.41, "mae_pct": -0.94, "durata_min": 185},
+        ]
+    }
+
+
+def test_raport_csv_scrie_si_raporteaza_succesul(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "FOLDER", str(tmp_path))
+    assert m.genereaza_raport_csv(_memorie_cu_inchidere("2026-09-08"), "2026-09-08") is True
+    linii = (tmp_path / "multitf_trades_2026-09-08.csv").read_text(encoding="utf-8").splitlines()
+    assert len(linii) == 2
+    assert "STOP LOSS (broker)" in linii[1]
+    assert linii[1].startswith("2026-09-08T14:47:00,MU,")
+
+
+def test_raport_csv_fara_inchideri_nu_scrie_fisier(tmp_path, monkeypatch):
+    """Trecerea premarket nu are ce raporta — si nu trebuie sa pretinda ca a facut-o."""
+    monkeypatch.setattr(m, "FOLDER", str(tmp_path))
+    assert m.genereaza_raport_csv(_memorie_cu_inchidere("2026-09-08"), "2026-09-09") is False
+    assert list(tmp_path.glob("*.csv")) == []
+
+
+def test_recuperare_scrie_doar_zilele_lipsa(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "FOLDER", str(tmp_path))
+    memorie = {"tranzactii": (_memorie_cu_inchidere("2026-09-08")["tranzactii"]
+                              + _memorie_cu_inchidere("2026-09-09", "AMD", 5.0)["tranzactii"])}
+    (tmp_path / "multitf_trades_2026-09-09.csv").write_text("deja aici", encoding="utf-8")
+
+    assert m.recupereaza_rapoarte_lipsa(memorie, "2026-09-13") == ["2026-09-08"]
+    assert (tmp_path / "multitf_trades_2026-09-08.csv").exists()
+    # raportul existent nu e rescris
+    assert (tmp_path / "multitf_trades_2026-09-09.csv").read_text(encoding="utf-8") == "deja aici"
+
+
+def test_recuperare_sare_ziua_curenta(tmp_path, monkeypatch):
+    """Ziua in curs se raporteaza pe fluxul normal, la inchiderea sesiunii."""
+    monkeypatch.setattr(m, "FOLDER", str(tmp_path))
+    memorie = _memorie_cu_inchidere("2026-09-08")
+    assert m.recupereaza_rapoarte_lipsa(memorie, "2026-09-08") == []
+    assert list(tmp_path.glob("*.csv")) == []
+
+
+def test_recuperare_fara_nimic_de_facut(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "FOLDER", str(tmp_path))
+    assert m.recupereaza_rapoarte_lipsa({"tranzactii": []}, "2026-09-13") == []
