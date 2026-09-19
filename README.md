@@ -196,6 +196,12 @@ Plus API: `GET /api/stats` returneaza JSON.
   si nu returneaza ultimele 15 min de date (de aici decalajul de 16 min din `get_date`).
   Un ciclu complet cere ~60-70 apeluri, deci limita nu e atinsa. Daca totusi vezi "Too Many Requests",
   mareste SCAN_INTERVAL_SEC sau redu numarul de actiuni.
+- **Pozitie ramasa deschisa la EOD**: inchiderea fortata de la 15:45 se reia la fiecare ciclu
+  pana cand chiar nu mai sunt pozitii. Daca stopul de la broker nu se anuleaza in
+  `ORDIN_TIMEOUT_SEC`, agentul nu poate vinde (actiunile sunt blocate de ordinul stop viu), dar
+  pastreaza id-ul stopului si reincearca — inainte marca inchiderea ca facuta si pozitia trecea
+  peste noapte *fara* stop, fiindca ordinele `day` expira la inchidere (AAPL, 14 sep 2026:
+  gap a doua zi, iesire la -1.2%).
 - **Desincronizare pozitii**: daca pozitii_active.json nu mai corespunde cu Alpaca, opreste agentul,
   corecteaza manual fisierul (sau sterge-l ca sa reporneasca de la zero) si reporneste serviciul.
 - **Bursa inchisa**: agentul doarme 300s si genereaza raportul. Normal.

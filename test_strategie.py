@@ -618,3 +618,130 @@ def test_recuperare_sare_ziua_curenta(tmp_path, monkeypatch):
 def test_recuperare_fara_nimic_de_facut(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "FOLDER", str(tmp_path))
     assert m.recupereaza_rapoarte_lipsa({"tranzactii": []}, "2026-09-13") == []
+
+
+# ─────────────────────────────────────────────────────────────
+# Inchiderea fortata EOD — incidentul AAPL din 14 sep 2026
+#
+# Stopul nu s-a anulat in 20s, agentul a sarit peste vanzare ("nu vand EOD") si
+# a marcat inchiderea ca facuta, deci n-a mai reincercat. Pozitia a trecut peste
+# noapte fara stop (ordinele `day` expira la inchidere), a doua zi a deschis in
+# gap si a iesit la -1.2% / -28.09 USD. In plus, `anuleaza_stop` uita id-ul
+# stopului, asa ca ciclurile urmatoare incercau sa plaseze altul peste cel inca
+# viu: "insufficient qty available for order (requested: 7, available: 0)".
+# ─────────────────────────────────────────────────────────────
+class _Ordin:
+    def __init__(self, oid="oid-1", status="new", qty=7, filled_qty=0,
+                 filled_avg_price=None):
+        self.id = oid
+        self.status = status
+        self.qty = qty
+        self.filled_qty = filled_qty
+        self.filled_avg_price = filled_avg_price
+
+
+class _ApiFals:
+    """Broker minimal: anularea nu confirma nimic daca `anulare_confirmata` e False."""
+
+    def __init__(self, stop, anulare_confirmata=True, vanzare=None):
+        self.anulare_confirmata = anulare_confirmata
+        self.vanzare = vanzare
+        self.ordine = {stop.id: stop}
+        self.ordine_trimise = []
+
+    def cancel_order(self, oid):
+        o = self.ordine[oid]
+        if self.anulare_confirmata and o.status != "filled":
+            o.status = "canceled"
+
+    def get_order(self, oid):
+        return self.ordine[oid]
+
+    def submit_order(self, **kw):
+        self.ordine_trimise.append(kw)
+        if self.vanzare is None:
+            raise Exception("insufficient qty available for order")
+        self.ordine[self.vanzare.id] = self.vanzare
+        return self.vanzare
+
+
+@pytest.fixture
+def broker(monkeypatch):
+    """Scurteaza asteptarile ca testele sa nu stea 20s pe ceas real."""
+    monkeypatch.setattr(m, "ORDIN_TIMEOUT_SEC", 0.03)
+    monkeypatch.setattr(m, "ORDIN_POLL_SEC", 0.01)
+
+    def instaleaza(api_fals):
+        monkeypatch.setattr(m, "api", api_fals)
+        return api_fals
+
+    return instaleaza
+
+
+def poz_cu_stop(cantitate=7):
+    p = poz(pret_intrare=333.91, cantitate=cantitate)
+    p["stop_order_id"] = "oid-1"
+    return p
+
+
+def test_anularea_confirmata_scoate_id_ul_stopului(broker):
+    broker(_ApiFals(_Ordin()))
+    p = poz_cu_stop()
+    assert m.anuleaza_stop("AAPL", p) == ("anulat", None)
+    assert "stop_order_id" not in p
+
+
+def test_anularea_neconfirmata_pastreaza_id_ul_stopului(broker):
+    """Fara id, ciclul urmator ar plasa un stop peste cel inca viu la broker."""
+    broker(_ApiFals(_Ordin(), anulare_confirmata=False))
+    p = poz_cu_stop()
+    assert m.anuleaza_stop("AAPL", p) == ("necunoscut", None)
+    assert p["stop_order_id"] == "oid-1"
+
+
+def test_eod_nu_declara_inchidere_cand_stopul_e_in_stare_incerta(broker):
+    api = broker(_ApiFals(_Ordin(), anulare_confirmata=False))
+    memorie = memorie_goala()
+    p = poz_cu_stop()
+
+    assert m.inchide_pozitie_eod("AAPL", p, memorie) is False
+    assert api.ordine_trimise == []          # nu se vinde peste un stop viu
+    assert memorie["tranzactii"] == []       # si nici nu se raporteaza inchisa
+    assert p["stop_order_id"] == "oid-1"
+
+
+def test_eod_nu_declara_inchidere_cand_vanzarea_e_respinsa(broker):
+    broker(_ApiFals(_Ordin(), vanzare=None))
+    memorie = memorie_goala()
+    assert m.inchide_pozitie_eod("AAPL", poz_cu_stop(), memorie) is False
+    assert memorie["tranzactii"] == []
+
+
+def test_eod_inchide_si_raporteaza_vanzarea_completa(broker):
+    vanzare = _Ordin("oid-2", "filled", qty=7, filled_qty=7, filled_avg_price=336.08)
+    broker(_ApiFals(_Ordin(), vanzare=vanzare))
+    memorie = memorie_goala()
+
+    assert m.inchide_pozitie_eod("AAPL", poz_cu_stop(), memorie) is True
+    (t,) = memorie["tranzactii"]
+    assert t["motiv"] == "END OF DAY"
+    assert t["profit"] == pytest.approx((336.08 - 333.91) * 7)
+
+
+def test_eod_reincearca_pentru_actiunile_ramase_dupa_executie_partiala(broker):
+    vanzare = _Ordin("oid-2", "filled", qty=7, filled_qty=3, filled_avg_price=336.08)
+    broker(_ApiFals(_Ordin(), vanzare=vanzare))
+    p = poz_cu_stop()
+
+    assert m.inchide_pozitie_eod("AAPL", p, memorie_goala()) is False
+    assert p["cantitate"] == 4
+
+
+def test_eod_inregistreaza_stopul_executat_in_timpul_anularii(broker):
+    stop_executat = _Ordin(status="filled", qty=7, filled_qty=7, filled_avg_price=330.91)
+    broker(_ApiFals(stop_executat))
+    memorie = memorie_goala()
+
+    assert m.inchide_pozitie_eod("AAPL", poz_cu_stop(), memorie) is True
+    (t,) = memorie["tranzactii"]
+    assert t["motiv"] == "STOP LOSS (broker)"

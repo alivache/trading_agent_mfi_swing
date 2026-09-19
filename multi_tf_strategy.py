@@ -597,7 +597,8 @@ def anuleaza_stop(simbol, poz):
     ordinul de vanzare al agentului e respins pentru cantitate insuficienta.
     Returneaza ("anulat" | "executat" | "absent" | "necunoscut", executie),
     unde executie e (pret, cantitate) doar daca stopul s-a executat chiar
-    in timpul anularii.
+    in timpul anularii. Pe "necunoscut" id-ul ramane in `poz`: stopul poate
+    fi inca viu la broker, deci nu e nimic de replasat.
     """
     oid = poz.pop("stop_order_id", None)
     if not oid:
@@ -618,6 +619,11 @@ def anuleaza_stop(simbol, poz):
         if o.status in ("canceled", "expired", "rejected", "suspended", "done_for_day"):
             return "anulat", None
         time.sleep(ORDIN_POLL_SEC)
+    # Starea reala a stopului e la broker, nu aici. Daca uitam id-ul, ciclul
+    # urmator vede o pozitie fara stop si incearca sa plaseze altul — respins,
+    # pentru ca actiunile sunt inca blocate de stopul viu ("insufficient qty
+    # available"). Asa s-a pierdut AAPL pe 14 sep 2026: 4 replasari esuate.
+    poz["stop_order_id"] = oid
     print(f"  ⚠️ {simbol}: stopul nu s-a anulat in {ORDIN_TIMEOUT_SEC}s")
     return "necunoscut", None
 
@@ -677,6 +683,45 @@ def sincronizeaza_stop(simbol, poz, memorie):
         poz["stop_order_id"] = nou
         print(f"  🛡️ {simbol}: stop la broker @ ${pret_stop:.2f}")
     return None
+
+
+def inchide_pozitie_eod(simbol, poz, memorie):
+    """Inchide o pozitie la inchiderea fortata. Returneaza True daca s-a inchis.
+
+    False inseamna "mai incearca la ciclul urmator, cat mai e sesiune": stopul
+    in stare incerta (nu putem vinde cat timp actiunile sunt blocate de el),
+    ordin respins sau executie partiala. Pozitia lasata peste noapte nu e
+    protejata — stopul de la broker e `day` si expira la inchidere.
+    """
+    stare_stop, executie_stop = anuleaza_stop(simbol, poz)
+    if stare_stop == "executat":
+        pret_exec, qty_exec = executie_stop
+        profit = (pret_exec - poz["pret_intrare"]) * qty_exec
+        log_tranzactie(memorie, simbol, "close_long", pret_exec, qty_exec,
+                       profit, "STOP LOSS (broker)", poz)
+        print(f"  🔴 {simbol}: inchis de stopul de la broker "
+              f"@ ${pret_exec:.2f} | ${profit:.2f}")
+        return True
+    if stare_stop == "necunoscut":
+        print(f"  ⚠️ {simbol}: stop in stare incerta — reincerc")
+        return False
+
+    executie = plaseaza_ordin(simbol, poz["cantitate"], "sell")
+    if not executie:
+        print(f"  ⚠️ {simbol}: NU s-a putut inchide EOD — reincerc")
+        return False
+
+    pret_exec, qty_exec = executie
+    profit = (pret_exec - poz["pret_intrare"]) * qty_exec
+    log_tranzactie(memorie, simbol, "close_long", pret_exec, qty_exec,
+                   profit, "END OF DAY", poz)
+    emoji = "🟢" if profit >= 0 else "🔴"
+    print(f"  {emoji} {simbol} inchis EOD: ${profit:.2f}")
+    if qty_exec < poz["cantitate"]:
+        poz["cantitate"] -= qty_exec
+        print(f"  ⚠️ {simbol}: raman {poz['cantitate']} actiuni nevandute — reincerc")
+        return False
+    return True
 
 
 # ═════════════════════════════════════════════════════════════
@@ -1014,41 +1059,26 @@ def ruleaza():
             # Inchidere fortata cu 15 min inainte
             if min_pana_inchidere <= INCHIDERE_MIN_INAINTE and not inchidere_facuta and pozitii:
                 print(f"🔔 END OF DAY — inchid toate pozitiile ({len(pozitii)})")
+                # Ce nu s-a putut inchide acum se reincearca la ciclul urmator,
+                # cat mai e sesiune. Inainte, un singur esec (stop in stare
+                # incerta, ordin respins, executie partiala) marca inchiderea ca
+                # facuta si pozitia trecea peste noapte fara protectie — stopul
+                # `day` expira la inchidere. AAPL, 14 sep 2026: gap in deschidere
+                # a doua zi, iesire la -1.2% (-28.09 USD), cea mai mare pierdere
+                # a saptamanii.
+                ramase = False
                 for simbol in list(pozitii.keys()):
-                    poz = pozitii[simbol]
-                    stare_stop, executie_stop = anuleaza_stop(simbol, poz)
-                    if stare_stop == "executat":
-                        pret_exec, qty_exec = executie_stop
-                        profit = (pret_exec - poz["pret_intrare"]) * qty_exec
-                        log_tranzactie(memorie, simbol, "close_long", pret_exec,
-                                       qty_exec, profit, "STOP LOSS (broker)", poz)
-                        print(f"  🔴 {simbol}: inchis de stopul de la broker "
-                              f"@ ${pret_exec:.2f} | ${profit:.2f}")
+                    if inchide_pozitie_eod(simbol, pozitii[simbol], memorie):
                         del pozitii[simbol]
-                        continue
-                    if stare_stop == "necunoscut":
-                        print(f"  ⚠️ {simbol}: stop in stare incerta — nu vand EOD")
-                        continue
-                    executie = plaseaza_ordin(simbol, poz["cantitate"], "sell")
-                    if executie:
-                        pret_exec, qty_exec = executie
-                        profit = (pret_exec - poz["pret_intrare"]) * qty_exec
-                        log_tranzactie(memorie, simbol, "close_long", pret_exec,
-                                       qty_exec, profit, "END OF DAY", poz)
-                        emoji = "🟢" if profit >= 0 else "🔴"
-                        print(f"  {emoji} {simbol} inchis EOD: ${profit:.2f}")
-                        if qty_exec < poz["cantitate"]:
-                            poz["cantitate"] -= qty_exec
-                            print(f"  ⚠️ {simbol}: raman {poz['cantitate']} actiuni nevandute")
-                        else:
-                            del pozitii[simbol]
                     else:
-                        print(f"  ⚠️ {simbol}: NU s-a putut inchide EOD — pozitia ramane")
+                        ramase = True
                 salveaza_pozitii(pozitii)
                 salveaza_memorie(memorie)
                 genereaza_raport_csv(memorie, zi)
                 raport_facut = True
-                inchidere_facuta = True
+                inchidere_facuta = not ramase
+                if ramase:
+                    print(f"  🔁 {len(pozitii)} pozitii neinchise — reiau la ciclul urmator")
 
             # ─── VERIFICARE IESIRI (pentru pozitiile deschise) ───
             for simbol in list(pozitii.keys()):
