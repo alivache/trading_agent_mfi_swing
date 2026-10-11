@@ -97,6 +97,12 @@ COOLDOWN_ORE = 4                    # cooldown 4h dupa o pierdere
 COOLDOWN_REINTRARE_MIN = 45         # cooldown 45 min dupa o iesire pe plus
 EARNINGS_BLOCARE_ZILE = 1           # blocheaza daca earnings in <= 1 zi
 STOP_INTRARI_ORE_INAINTE = 2        # fara intrari noi cu 2h inainte de inchidere
+# Pe 25 aug - 9 oct 2026, cele 14 intrari din primele 15 minute au dat -127.89 USD
+# cu 9 stopuri (64%), fata de +105.31 USD si 19 stopuri din 82 (23%) pentru rest:
+# volatilitatea de la deschidere trece de stopul de 0.9% inainte ca trade-ul sa
+# apuce sa lucreze. Tipar gasit dupa ce am vazut datele (permutare p=0.027), deci
+# e o ipoteza de reverificat, nu un rezultat.
+FARA_INTRARI_MIN_DUPA_DESCHIDERE = 15   # fara intrari in primele 15 min de sesiune
 INCHIDERE_MIN_INAINTE = 15          # inchide tot cu 15 min inainte de inchidere
 CACHE_GRAFICE_CICLURI = 5           # scrie cache grafice la fiecare 5 cicluri (bursa deschisa)
 CACHE_GRAFICE_CICLURI_INCHIS = 10   # la fiecare 10 cand bursa e inchisa
@@ -115,6 +121,17 @@ CLUSTERE = {
     "megacap": {"AAPL", "MSFT", "GOOGL", "AMZN", "META", "NFLX", "TSLA"},
     "software": {"CRM", "ADBE", "ORCL", "PYPL"},
 }
+
+# Clustere in care agentul nu mai deschide pozitii. Ipoteza din august s-a
+# confirmat pe un esantion nou: pe 25 aug - 9 oct 2026, cele 46 de tranzactii semi
+# au dat -244.36 USD (WR 41%, stop in 41% din cazuri), iar cele 50 din afara
+# +221.78 USD (WR 66%, stop in 18%); semi pe minus in 6 saptamani din 7. Castigul
+# mediu e acelasi (+0.67% vs +0.58%), deci stopul de 0.9% sta in zgomotul lor
+# fara un upside care sa-l plateasca.
+# Simbolurile raman in ACTIUNI: scannerele shadow citesc aceeasi lista din .env
+# si trebuie sa continue sa le urmareasca, iar o pozitie semi deja deschisa se
+# gestioneaza normal pana la iesire.
+CLUSTERE_EXCLUSE = {"semi"}
 
 # Fisiere de stare
 POZITII_FILE = os.path.join(FOLDER, "pozitii_active.json")
@@ -426,6 +443,22 @@ def cluster_plin(pozitii, simbol):
         return False
     deschise = sum(1 for s in pozitii if cluster_pentru(s) == grup)
     return deschise >= MAX_POZITII_CLUSTER
+
+
+def cluster_exclus(simbol):
+    """True daca simbolul e intr-un cluster in care nu se mai deschid pozitii."""
+    return cluster_pentru(simbol) in CLUSTERE_EXCLUSE
+
+
+def minute_de_la_deschidere(moment):
+    """Minute scurse de la deschiderea sesiunii (09:30 NY). Functie pura.
+
+    Negativ inainte de deschidere. Bursa deschide la 09:30 si in zilele cu
+    program scurt, deci ora nu trebuie luata de la broker.
+    """
+    local = moment.astimezone(NY_TZ)
+    deschidere = local.replace(hour=9, minute=30, second=0, microsecond=0)
+    return (local - deschidere).total_seconds() / 60
 
 
 def seteaza_cooldown(memorie, simbol, durata):
@@ -900,6 +933,8 @@ def afiseaza_config():
     print(f"📅 Blocare earnings: {EARNINGS_BLOCARE_ZILE} zi | Manual: {len(EARNINGS_MANUAL)} simboluri")
     print(f"🧩 Max {MAX_POZITII} pozitii, din care max {MAX_POZITII_CLUSTER} pe cluster "
           f"({', '.join(CLUSTERE)})")
+    print(f"🚫 Fara intrari: cluster {', '.join(sorted(CLUSTERE_EXCLUSE)) or '-'} | "
+          f"primele {FARA_INTRARI_MIN_DUPA_DESCHIDERE} min de la deschidere")
     print(f"🔔 Inchidere: {INCHIDERE_MIN_INAINTE} min inainte | Stop intrari: {STOP_INTRARI_ORE_INAINTE}h inainte")
     print(f"⏱️  Scanare la fiecare {SCAN_INTERVAL_SEC}s | Cache grafice la {CACHE_GRAFICE_CICLURI} cicluri")
     print(f"📋 {len(ACTIUNI)} actiuni: {', '.join(ACTIUNI[:10])}{'...' if len(ACTIUNI) > 10 else ''}")
@@ -1143,15 +1178,23 @@ def ruleaza():
 
             # ─── CAUTARE INTRARI ───
             stop_intrari = min_pana_inchidere <= STOP_INTRARI_ORE_INAINTE * 60
+            prea_devreme = minute_de_la_deschidere(acum) < FARA_INTRARI_MIN_DUPA_DESCHIDERE
+            if prea_devreme:
+                print(f"  ⏳ Fara intrari in primele "
+                      f"{FARA_INTRARI_MIN_DUPA_DESCHIDERE} min de la deschidere")
             poate_intra = (len(pozitii) < MAX_POZITII
                            and trades_azi < MAX_TRADES_PER_DAY
-                           and not stop_intrari)
+                           and not stop_intrari
+                           and not prea_devreme)
 
             if poate_intra:
                 for simbol in ACTIUNI:
                     if len(pozitii) >= MAX_POZITII or trades_azi >= MAX_TRADES_PER_DAY:
                         break
                     if simbol in pozitii:
+                        continue
+                    # Fara linie in log: ar fi 8 simboluri x fiecare ciclu, mereu la fel.
+                    if cluster_exclus(simbol):
                         continue
                     if cluster_plin(pozitii, simbol):
                         print(f"  ⏳ {simbol}: cluster {cluster_pentru(simbol)} plin "

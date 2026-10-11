@@ -45,7 +45,8 @@ o limita inferioara a miscarii reale. Sunt baza pentru calibrarea trailing-ului 
 Tranzactiile de dinaintea instrumentarii au coloanele goale.
 
 **Filtre**: cooldown 4h dupa pierdere, blocare earnings (1 zi), max 5 pozitii,
-max trades/zi din .env, fara intrari cu 2h inainte de inchidere, inchidere fortata cu 15 min inainte.
+max trades/zi din .env, fara intrari in primele 15 min de la deschidere si cu 2h inainte de inchidere,
+fara intrari pe clusterul semi (`CLUSTERE_EXCLUSE`), inchidere fortata cu 15 min inainte.
 
 ## Instalare
 

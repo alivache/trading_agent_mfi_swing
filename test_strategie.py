@@ -4,7 +4,7 @@ Acopera zona modificata cel mai des: conditiile de iesire, indicatorii si
 persistenta. Nu se face niciun apel catre Alpaca.
 """
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -276,6 +276,65 @@ def test_clusterele_nu_se_suprapun():
     """Un simbol intr-un singur cluster — altfel cluster_pentru ar fi ambigua."""
     membri = [s for grup in m.CLUSTERE.values() for s in grup]
     assert len(membri) == len(set(membri))
+
+
+# ─────────────────────────────────────────────────────────────
+# Clustere excluse de la intrari
+# ─────────────────────────────────────────────────────────────
+def test_tot_clusterul_semi_e_exclus():
+    assert all(m.cluster_exclus(s) for s in m.CLUSTERE["semi"])
+
+
+def test_celelalte_clustere_nu_sunt_excluse():
+    for nume in ("megacap", "software"):
+        assert not any(m.cluster_exclus(s) for s in m.CLUSTERE[nume])
+
+
+def test_simbol_neincadrat_nu_e_exclus():
+    assert m.cluster_pentru("CSCO") is None
+    assert m.cluster_exclus("CSCO") is False
+
+
+def test_clusterele_excluse_exista():
+    """O greseala de tipar in CLUSTERE_EXCLUSE ar dezactiva filtrul fara zgomot."""
+    assert m.CLUSTERE_EXCLUSE <= set(m.CLUSTERE)
+
+
+def test_excluderea_urmeaza_configuratia(monkeypatch):
+    monkeypatch.setattr(m, "CLUSTERE_EXCLUSE", set())
+    assert m.cluster_exclus("NVDA") is False
+
+
+# ─────────────────────────────────────────────────────────────
+# Fara intrari in primele minute de la deschidere
+# ─────────────────────────────────────────────────────────────
+def ny(ora, minut, secunda=0):
+    return datetime(2026, 10, 12, ora, minut, secunda, tzinfo=m.NY_TZ)
+
+
+def test_minute_de_la_deschidere_zero_la_clopotel():
+    assert m.minute_de_la_deschidere(ny(9, 30)) == 0
+
+
+def test_minute_de_la_deschidere_in_sesiune():
+    assert m.minute_de_la_deschidere(ny(9, 44, 30)) == pytest.approx(14.5)
+    assert m.minute_de_la_deschidere(ny(13, 0)) == 210
+
+
+def test_minute_de_la_deschidere_negativ_in_premarket():
+    assert m.minute_de_la_deschidere(ny(9, 0)) == -30
+
+
+def test_minute_de_la_deschidere_nu_depinde_de_fusul_masinii():
+    """VM-ul ruleaza pe UTC: 13:40 UTC in octombrie inseamna 09:40 la New York."""
+    utc = datetime(2026, 10, 12, 13, 40, tzinfo=timezone.utc)
+    assert m.minute_de_la_deschidere(utc) == 10
+
+
+def test_pragul_de_deschidere_blocheaza_pana_la_09_45():
+    prag = m.FARA_INTRARI_MIN_DUPA_DESCHIDERE
+    assert m.minute_de_la_deschidere(ny(9, 44, 59)) < prag
+    assert not m.minute_de_la_deschidere(ny(9, 45)) < prag
 
 
 # ─────────────────────────────────────────────────────────────
