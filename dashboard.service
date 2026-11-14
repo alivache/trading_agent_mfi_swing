@@ -1,5 +1,5 @@
 [Unit]
-Description=Dashboard Trading Multi-Timeframe (v3, port 8080)
+Description=Dashboard Gap Shadow + analist Claude (port 8080, read-only)
 After=network-online.target
 Wants=network-online.target
 
@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/trading-v3
-ExecStart=/home/ubuntu/trading-v3/venv/bin/python /home/ubuntu/trading-v3/dashboard.py
+ExecStart=/home/ubuntu/trading-v3/venv/bin/python /home/ubuntu/trading-v3/dashboard_gap.py
 Restart=always
 RestartSec=10
 

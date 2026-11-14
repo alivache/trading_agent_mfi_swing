@@ -1,0 +1,17 @@
+[Unit]
+Description=Gap Scanner + Claude Analyst Shadow (no orders)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trading-v3
+ExecStart=/home/ubuntu/trading-v3/venv/bin/python /home/ubuntu/trading-v3/gap_shadow.py --serviciu
+# Fara asta, sub systemd print-urile stau in buffer si log-ul pare blocat (vezi agent.log v3).
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

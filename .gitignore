@@ -5,3 +5,9 @@ venv/
 *.json
 *.csv
 *.log
+jurnal_analist/
+jurnal_replay/
+jurnal_replay_v2/
+cache_stiri/
+jurnal_stiri_test/
+cercetare/cache/
