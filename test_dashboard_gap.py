@@ -151,6 +151,35 @@ def test_urmatoarea_analiza_sare_weekendul():
     assert dashboard_gap.urmatoarea_analiza(luni_dimineata) == datetime(2026, 11, 16, 9, 0, tzinfo=NY)
 
 
+def test_pagina_robot_goala(jurnale, client, tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_gap, "DIR_ROBOT", str(tmp_path / "robot"))
+    html = client.get("/robot").get_data(as_text=True)
+    assert "Nicio decizie încă" in html and "doar paper" in html
+
+
+def test_pagina_robot_cu_decizii_si_tranzactii(jurnale, client, tmp_path, monkeypatch):
+    robot = tmp_path / "robot"
+    monkeypatch.setattr(dashboard_gap, "DIR_ROBOT", str(robot))
+    scrie(robot, "2026-11-16.jsonl", [
+        {"pas": "decizie", "zi": "2026-11-16", "simbol": "SPY", "actiune": "cumpara", "pret": 740.1,
+         "rsi2": 6.2, "sma200": 729.6, "sma5": 750.0, "ordin": {"cid": "x", "tif": "cls", "status": "accepted"}},
+        {"pas": "decizie", "zi": "2026-11-16", "simbol": "QQQ", "actiune": "nimic", "pret": 670.0,
+         "rsi2": 8.0, "sma200": 681.0, "sma5": 680.0},
+        {"pas": "verificare", "zi": "2026-11-16", "simbol": "SPY",
+         "ordin": {"status": "filled", "pret_mediu": 740.5}, "semnal_cu_inchiderea_oficiala": {"actiune": "cumpara"}},
+    ])
+    scrie(robot, "tranzactii.jsonl", [{"simbol": "SPY", "zi_intrare": "2026-11-10", "zi_iesire": "2026-11-13",
+                                       "pret_intrare": 700.0, "pret_iesire": 707.0, "qty": 14,
+                                       "randament_pct": 1.0, "profit_usd": 98.0}])
+    (robot / "stare.json").write_text(json.dumps({"pozitii": {"SPY": {"qty": 13, "pret_intrare": 740.5,
+                                                                     "zi_intrare": "2026-11-16", "cid": "x"}},
+                                                  "in_asteptare": {}, "zile": {}}), encoding="utf-8")
+    html = client.get("/robot").get_data(as_text=True)
+    assert "cumpara" in html and "6.2" in html and "filled @ 740.50" in html
+    assert "+98.00 $" in html and "1 câștigătoare" in html
+    assert "740.50" in html                                     # pozitia deschisa
+
+
 def test_api_stare(jurnale, client):
     j = client.get("/api/stare").get_json()
     assert j["serviciu"] == "active" and j["ultima_zi"] is None

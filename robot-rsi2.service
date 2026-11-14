@@ -1,0 +1,19 @@
+[Unit]
+Description=Robot RSI2 pe SPY si QQQ (DOAR PAPER, ordine la inchidere)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/trading-v3
+ExecStart=/home/ubuntu/trading-v3/venv/bin/python /home/ubuntu/trading-v3/robot_rsi2.py --serviciu
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=30
+# Codul 2 = robotul a refuzat sa porneasca pentru ca .env nu indica contul paper.
+# Atunci NU il repornim: trebuie corectata configurarea, nu reincercat.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

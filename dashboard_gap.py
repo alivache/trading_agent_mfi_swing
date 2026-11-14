@@ -30,6 +30,7 @@ DIR_LIVE = analyst.DIR_JURNAL
 DIR_REPLAY = os.path.join(analyst.AICI, "jurnal_replay")
 DIR_REPLAY_V2 = os.path.join(analyst.AICI, "jurnal_replay_v2")
 SURSE = {"live": DIR_LIVE, "replay": DIR_REPLAY, "replay_v2": DIR_REPLAY_V2}
+DIR_ROBOT = os.path.join(analyst.AICI, "jurnal_robot_rsi2")
 PRET_INPUT_USD_PE_MTOK = 2.0      # claude-sonnet-5-5
 PRET_OUTPUT_USD_PE_MTOK = 10.0    # include si tokenii de gandire
 FORMAT_ZI = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -163,6 +164,33 @@ def tabel_pe_zile(evaluari: list[dict]) -> list[dict]:
     return randuri
 
 
+def date_robot() -> dict:
+    """Starea robotului RSI2, ultimele decizii si tranzactiile inchise (doar citire)."""
+    try:
+        with open(os.path.join(DIR_ROBOT, "stare.json"), encoding="utf-8") as f:
+            stare = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        stare = {"pozitii": {}, "in_asteptare": {}, "zile": {}}
+    fisiere = os.listdir(DIR_ROBOT) if os.path.isdir(DIR_ROBOT) else []
+    zile = sorted((f[:-6] for f in fisiere if f.endswith(".jsonl") and FORMAT_ZI.match(f[:-6])), reverse=True)
+    decizii = []
+    for zi in zile[:10]:
+        inregistrari = citeste_jsonl(os.path.join(DIR_ROBOT, f"{zi}.jsonl"))
+        pe_simbol = {}
+        for r in inregistrari:
+            if r.get("pas") == "decizie" and "simbol" in r:
+                pe_simbol.setdefault(r["simbol"], {})["decizie"] = r
+            elif r.get("pas") == "verificare" and "simbol" in r:
+                pe_simbol.setdefault(r["simbol"], {})["verificare"] = r
+        for s, d in sorted(pe_simbol.items()):
+            decizii.append({"zi": zi, "simbol": s, **d})
+    tranzactii = citeste_jsonl(os.path.join(DIR_ROBOT, "tranzactii.jsonl"))
+    profit = round(sum(t["profit_usd"] for t in tranzactii), 2)
+    return {"stare": stare, "decizii": decizii, "tranzactii": list(reversed(tranzactii)),
+            "profit_total": profit, "castigatoare": sum(1 for t in tranzactii if t["profit_usd"] > 0),
+            "serviciu": stare_serviciu("robot-rsi2")}
+
+
 # ---------------------------------------------------------------- pagina
 
 PAGINA = """<!DOCTYPE html>
@@ -219,22 +247,88 @@ PAGINA = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-  <h1>Gap Shadow — analist Claude</h1>
+  <h1>Trading — gap shadow și robot RSI2</h1>
   <div class="sub">Actualizat {{ acum_et }} ET ({{ acum_ro }} ora RO) · reîmprospătare la 120 s</div>
 
+  {% if tab != 'robot' %}
   <div class="banda">
-    <b>Mod shadow: fără ordine.</b>
+    <b>Gap shadow (analist Claude): fără ordine.</b>
     Serviciul <code>gap-shadow</code>: <b class="{{ 'verde' if serviciu == 'active' else 'rosu' }}">{{ serviciu }}</b>
     · următoarea analiză: {{ urmatoarea_et }} ET ({{ urmatoarea_ro }} ora RO)
     · model {{ model }}
   </div>
+  {% endif %}
 
   <div class="tabs">
     <a href="/" class="tab {{ 'activ' if tab == 'zi' else '' }}">Ziua</a>
     <a href="/rezultate?sursa=live" class="tab {{ 'activ' if tab == 'rezultate' and sursa == 'live' else '' }}">Rezultate live</a>
     <a href="/rezultate?sursa=replay" class="tab {{ 'activ' if tab == 'rezultate' and sursa == 'replay' else '' }}">Rezultate replay</a>
     <a href="/rezultate?sursa=replay_v2" class="tab {{ 'activ' if tab == 'rezultate' and sursa == 'replay_v2' else '' }}">Replay v2 (știri + SEC)</a>
+    <a href="/robot" class="tab {{ 'activ' if tab == 'robot' else '' }}">Robot RSI2</a>
   </div>
+
+{% if tab == 'robot' %}
+  <div class="banda">
+    <b>Robot RSI2 pe SPY și QQQ — doar paper.</b>
+    Serviciul <code>robot-rsi2</code>: <b class="{{ 'verde' if r.serviciu == 'active' else 'rosu' }}">{{ r.serviciu }}</b>
+    · decizie zilnică la 15:44 ET (22:44 ora RO), ordine la închidere · 10.000 USD/simbol · fără stop
+  </div>
+  <div class="carduri">
+    <div class="card"><div class="eticheta">Poziții deschise</div><div class="valoare">{{ r.stare.pozitii|length }}</div></div>
+    <div class="card"><div class="eticheta">Tranzacții închise</div><div class="valoare">{{ r.tranzactii|length }}</div>
+      <div class="detaliu">{{ r.castigatoare }} câștigătoare</div></div>
+    <div class="card"><div class="eticheta">Profit realizat</div>
+      <div class="valoare {{ 'verde' if r.profit_total > 0 else ('rosu' if r.profit_total < 0 else '') }}">{{ "%+.2f"|format(r.profit_total) }} $</div></div>
+    <div class="card"><div class="eticheta">Ordine în așteptare</div><div class="valoare">{{ r.stare.in_asteptare|length }}</div></div>
+  </div>
+
+  {% if r.stare.pozitii %}
+  <h2>Poziții</h2>
+  <div class="tabel-box"><table>
+    <thead><tr><th>Simbol</th><th class="num">Cantitate</th><th class="num">Preț intrare</th><th>Intrat pe</th></tr></thead>
+    <tbody>{% for s, p in r.stare.pozitii.items() %}
+      <tr><td><b>{{ s }}</b></td><td class="num">{{ p.qty|int }}</td><td class="num">{{ "%.2f"|format(p.pret_intrare) }}</td><td>{{ p.zi_intrare }}</td></tr>
+    {% endfor %}</tbody>
+  </table></div>
+  {% endif %}
+
+  <h2>Decizii zilnice</h2>
+  {% if not r.decizii %}
+    <div class="gol">Nicio decizie încă. Prima: luni la 15:44 ET (22:44 ora României).</div>
+  {% else %}
+  <div class="tabel-box"><table>
+    <thead><tr><th>Zi</th><th>Simbol</th><th class="num">Preț 15:44</th><th class="num">RSI(2)</th><th class="num">SMA200</th>
+      <th class="num">SMA5</th><th>Decizie</th><th>Ordin</th><th>Cu închiderea oficială</th></tr></thead>
+    <tbody>{% for d in r.decizii %}{% set x = d.decizie or {} %}{% set v = d.verificare or {} %}
+      <tr><td>{{ d.zi }}</td><td><b>{{ d.simbol }}</b></td>
+        <td class="num">{{ x.pret if x.pret is defined else '–' }}</td>
+        <td class="num">{{ x.rsi2 if x.rsi2 is defined else '–' }}</td>
+        <td class="num">{{ x.sma200 if x.sma200 is defined else '–' }}</td>
+        <td class="num">{{ x.sma5 if x.sma5 is defined else '–' }}</td>
+        <td>{% if x.eroare %}<span class="rosu">eroare</span>{% elif x.alarma %}<span class="rosu">{{ x.alarma }}</span>{% else %}{{ x.actiune or '–' }}{% endif %}</td>
+        <td class="gri">{% if x.ordin %}{{ x.ordin.tif or '' }} {{ x.ordin.status or ('deja trimis' if x.ordin.deja_trimis else '') }}{% endif %}
+          {% if v.ordin %} → {{ v.ordin.status }}{% if v.ordin.pret_mediu %} @ {{ "%.2f"|format(v.ordin.pret_mediu) }}{% endif %}{% endif %}</td>
+        <td class="gri">{{ v.semnal_cu_inchiderea_oficiala.actiune if v.semnal_cu_inchiderea_oficiala and v.semnal_cu_inchiderea_oficiala.actiune is defined else '–' }}</td></tr>
+    {% endfor %}</tbody>
+  </table></div>
+  <div class="nota">„Cu închiderea oficială” = ce ar fi decis testul istoric, care folosea prețul de închidere exact.
+    Dacă diferă des de decizia de la 15:44, rezultatele live se vor depărta de cele din test.</div>
+  {% endif %}
+
+  {% if r.tranzactii %}
+  <h2>Tranzacții închise</h2>
+  <div class="tabel-box"><table>
+    <thead><tr><th>Simbol</th><th>Intrare</th><th>Ieșire</th><th class="num">Preț intrare</th><th class="num">Preț ieșire</th>
+      <th class="num">Rezultat</th><th class="num">Profit</th></tr></thead>
+    <tbody>{% for t in r.tranzactii %}
+      <tr><td><b>{{ t.simbol }}</b></td><td>{{ t.zi_intrare }}</td><td>{{ t.zi_iesire }}</td>
+        <td class="num">{{ "%.2f"|format(t.pret_intrare) }}</td><td class="num">{{ "%.2f"|format(t.pret_iesire) }}</td>
+        <td class="num {{ 'verde' if t.randament_pct > 0 else 'rosu' }}">{{ "%+.2f"|format(t.randament_pct) }}%</td>
+        <td class="num {{ 'verde' if t.profit_usd > 0 else 'rosu' }}">{{ "%+.2f"|format(t.profit_usd) }} $</td></tr>
+    {% endfor %}</tbody>
+  </table></div>
+  {% endif %}
+{% endif %}
 
 {% if tab == 'zi' %}
   {% if not d.ultima %}
@@ -439,6 +533,11 @@ def pagina_rezultate():
         PAGINA, rezumat=rezumat, serie=serie_cumulata(evaluari), pe_zile=tabel_pe_zile(evaluari),
         nr_zile=len({e["zi"] for e in cu_rezultat}), nr_candidati=len(cu_rezultat),
         **_comune("rezultate", sursa))
+
+
+@app.route("/robot")
+def pagina_robot():
+    return render_template_string(PAGINA, r=date_robot(), **_comune("robot"))
 
 
 @app.route("/api/stare")
