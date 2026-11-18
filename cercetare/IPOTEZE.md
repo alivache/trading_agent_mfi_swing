@@ -72,6 +72,29 @@ t = −4.6). Aici se verifică dacă efectul există pe mulți ani și dacă rez
 - **Limitări declarate:** nu știu ce acțiuni erau ușor de împrumutat istoric; taxa de împrumut nu e
   inclusă; opririle de tranzacționare apar doar ca lipsă de bare.
 
+## H5 — Regula H3 pe alți ETF-i (adăugat 18 noiembrie 2026, înainte de rulare)
+
+Motivat de cererea de a extinde robotul RSI2 dincolo de SPY și QQQ. Scris înainte să văd vreun
+rezultat pe simbolurile de mai jos; cadrul comun (date, perioade, costuri 0.05% pe sens, cash = 0)
+rămâne cel de sus.
+
+- **Univers (11 ETF-uri, fixat acum):** IWM (Russell 2000), DIA (Dow Jones) și cele 9 SPDR
+  sectoriale din H2: XLB, XLE, XLF, XLI, XLK, XLP, XLU, XLV, XLY. Nu adaug alte simboluri după
+  ce văd rezultatele.
+- **Regula:** exact H3, neschimbată (RSI Wilder pe 2 zile < 10 și închiderea > SMA200 → cumpăr la
+  închidere; vând la închidere când închiderea > SMA5). Niciun parametru nu se ajustează pe simbol.
+- **Testare multiplă:** 11 teste simultane. Cu pragul t > 2 al lui H3, șansa ca măcar unul să
+  treacă din întâmplare e mare. Corecție Bonferroni pentru 11 teste (α = 0.05/11, bilateral):
+  **t > 2.85**.
+- **Un simbol trece dacă**, în perioada de verificare: câștigul mediu pe tranzacție după costuri
+  > 0 cu **t > 2.85** **și** Sharpe-ul strategiei ≥ Sharpe-ul cumpărării și păstrării aceluiași
+  simbol. Doar simbolurile care trec se pot adăuga în robot.
+- **Raportat, dar nu decide:** simbolurile cu 2 < t ≤ 2.85 („promițătoare”, nu se adaugă);
+  rezultatul din calibrare; cât de des un simbol e în poziție în aceleași zile cu SPY (dacă
+  intră mereu odată cu SPY, adaugă concentrare, nu diversificare); numărul maxim de poziții
+  deschise simultan pe SPY + QQQ + simbolurile care trec (contează pentru capitalul de paper,
+  ~97.000 USD la 10.000 pe simbol).
+
 ## Ce urmează după rezultate
 
 - Ce nu trece criteriul **nu** se construiește, oricât de aproape ar fi.
