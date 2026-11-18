@@ -123,12 +123,11 @@ INCHIDERE = datetime(2026, 11, 16, 16, 0, tzinfo=NY)
 
 
 class BrokerFals:
-    def __init__(self, preturi_istorice=None, pret_curent=None, la_broker=None, respinge_cls=False):
+    def __init__(self, preturi_istorice=None, pret_curent=None, la_broker=None):
         sus = list(np.linspace(100, 130, 220)) + [126.0]
         self.istoric = preturi_istorice or {s: sus for s in SIMBOLURI}
         self.pret = pret_curent or {s: 122.0 for s in SIMBOLURI}       # a doua zi de cadere -> cumpara
         self.la_broker = la_broker or {}
-        self.respinge_cls = respinge_cls
         self.ordine, self.trimise = {}, []
         self.azi = None                                                # bara zilnica a zilei curente
 
@@ -151,8 +150,6 @@ class BrokerFals:
         return self.la_broker.get(simbol, 0.0)
 
     def trimite(self, simbol, parte, qty, cid, tif):
-        if tif == "cls" and self.respinge_cls:
-            raise RuntimeError("cls rejected")
         self.trimise.append((simbol, parte, qty, cid, tif))
         self.ordine[cid] = {"id": cid, "status": "accepted", "filled_qty": 0, "pret_mediu": None}
         return {"id": cid, "status": "accepted", "tif": tif}
@@ -175,8 +172,8 @@ def test_decizia_trimite_ordine_la_inchidere_cu_10000_usd():
     b, st = BrokerFals(), stare_goala()
     rez = decide(b, datetime(2026, 11, 16, 15, 44, tzinfo=NY), INCHIDERE, st)
     assert [r["actiune"] for r in rez] == ["cumpara", "cumpara"]
-    assert b.trimise == [("SPY", "buy", 81, "rsi2-SPY-2026-11-16-buy", "cls"),
-                         ("QQQ", "buy", 81, "rsi2-QQQ-2026-11-16-buy", "cls")]
+    assert b.trimise == [("SPY", "buy", 81, "rsi2-SPY-2026-11-16-buy", "day"),
+                         ("QQQ", "buy", 81, "rsi2-QQQ-2026-11-16-buy", "day")]
     assert set(st["in_asteptare"]) == {"SPY", "QQQ"}
 
 
@@ -187,17 +184,12 @@ def test_repornirea_nu_trimite_ordinul_de_doua_ori():
     assert len(b.trimise) == 2
 
 
-def test_cls_respins_trece_pe_ordin_market_obisnuit():
-    b, st = BrokerFals(respinge_cls=True), stare_goala()
-    rez = decide(b, datetime(2026, 11, 16, 15, 44, tzinfo=NY), INCHIDERE, st)
-    assert all(t[4] == "day" and t[3].endswith("-day") for t in b.trimise)
-    assert all("respins_cls" in r for r in rez)
-
-
-def test_dupa_15_50_se_trimite_direct_ordin_day():
-    b, st = BrokerFals(), stare_goala()
-    decide(b, datetime(2026, 11, 16, 15, 52, tzinfo=NY), INCHIDERE, st)
-    assert all(t[4] == "day" for t in b.trimise)
+def test_nu_se_mai_trimit_ordine_cls():
+    # Alpaca paper nu executa `cls` (expira la 16:00 cu 0 bucati, 16 si 17 nov 2026)
+    for minut in (44, 52):
+        b, st = BrokerFals(), stare_goala()
+        decide(b, datetime(2026, 11, 16, 15, minut, tzinfo=NY), INCHIDERE, st)
+        assert b.trimise and all(t[4] == "day" for t in b.trimise)
 
 
 def test_pozitie_disparuta_la_broker_blocheaza_simbolul():

@@ -7,8 +7,9 @@ Regula e exact cea testata in cercetare/IPOTEZE.md (H3, singura care a trecut pe
 
 Cum ruleaza o zi de bursa:
   1. la inchidere - 16 min (15:44 ET; 12:44 in zilele scurte) calculeaza semnalul cu pretul
-     curent pe post de "inchidere" si trimite ordine `cls` (market on close). Alpaca le
-     accepta pana la inchidere - 10 min; dupa aceea le respinge;
+     curent pe post de "inchidere" si trimite imediat ordine market `day`. Nu `cls`: Alpaca
+     paper accepta ordinele `cls`, dar nu le executa niciodata (expira la 16:00 cu 0 bucati,
+     vazut pe 16 si 17 nov 2026), asa ca executia e la pretul de la 15:44, nu la inchidere;
   2. la inchidere + 20 min verifica executiile, actualizeaza pozitiile si recalculeaza
      semnalul cu inchiderea oficiala, ca sa masuram cat difera live de test.
 
@@ -45,7 +46,7 @@ SUMA_PE_SIMBOL_USD = 10_000                               # ales de user pe 14 n
 RSI_PRAG = 10
 SMA_LUNG, SMA_SCURT = 200, 5
 DECIZIE_INAINTE = timedelta(minutes=16)                   # 15:44 ET
-LIMITA_CLS_INAINTE = timedelta(minutes=10)                # Alpaca respinge `cls` dupa 15:50 ET
+FEREASTRA_DECIZIE = timedelta(minutes=14)                 # decizia se poate reincerca 15:44-15:58 ET
 VERIFICARE_DUPA = timedelta(minutes=20)                   # SIP intarziat 15 min -> bara zilnica completa
 ZILE_ISTORIC = 420                                        # calendaristice: ~290 zile de bursa > 200
 INTARZIERE_SIP = timedelta(minutes=16)                    # planul gratuit: SIP doar mai vechi de 15 min
@@ -185,7 +186,7 @@ def jurnal(nume: str, inregistrare: dict) -> None:
 # ---------------------------------------------------------------- pasii zilei
 
 def decide(broker, acum: datetime, inchidere: datetime, stare: dict) -> list[dict]:
-    """Pasul 1: semnalul cu pretul curent si ordinele `cls` (cu rezerva `day` daca sunt respinse)."""
+    """Pasul 1: semnalul cu pretul curent si ordinele market `day`, trimise imediat."""
     zi = acum.date().isoformat()
     rezultate = []
     stare["in_pozitie_la_decizie"] = {s: s in stare["pozitii"] for s in SIMBOLURI}
@@ -214,20 +215,10 @@ def decide(broker, acum: datetime, inchidere: datetime, stare: dict) -> list[dic
                 rezultate.append(r)
                 continue
             cid = f"rsi2-{s}-{zi}-{parte}"
-            existent = next((c for c in (cid, cid + "-day") if broker.ordin(c) is not None), None)
-            if existent:                                                       # repornire: deja trimis
-                r.update(ordin={"cid": existent, "deja_trimis": True})
+            if broker.ordin(cid) is not None:                                  # repornire: deja trimis
+                r.update(ordin={"cid": cid, "deja_trimis": True})
             else:
-                tif = "cls" if acum < inchidere - LIMITA_CLS_INAINTE else "day"
-                try:
-                    r["ordin"] = {"cid": cid, "qty": qty, **broker.trimite(s, parte, qty, cid, tif)}
-                except Exception as e:
-                    if tif != "cls":
-                        raise
-                    # `cls` respins (ex. trimis prea tarziu): ordin market obisnuit, imediat
-                    r["respins_cls"] = f"{type(e).__name__}: {e}"
-                    cid += "-day"
-                    r["ordin"] = {"cid": cid, "qty": qty, **broker.trimite(s, parte, qty, cid, "day")}
+                r["ordin"] = {"cid": cid, "qty": qty, **broker.trimite(s, parte, qty, cid, "day")}
             stare["in_asteptare"][s] = {"cid": r["ordin"]["cid"], "parte": parte, "zi": zi,
                                          "pret_decizie": pret, "indicatori": sem}
         except Exception as e:
@@ -288,7 +279,7 @@ def ce_de_facut(acum: datetime, sesiune, stare: dict) -> str | None:
         return None
     _, inchidere = sesiune
     z = stare["zile"].get(acum.date().isoformat(), {})
-    if inchidere - DECIZIE_INAINTE <= acum < inchidere - LIMITA_CLS_INAINTE + timedelta(minutes=8) \
+    if inchidere - DECIZIE_INAINTE <= acum < inchidere - DECIZIE_INAINTE + FEREASTRA_DECIZIE \
             and not z.get("decizie"):
         return "decizie"
     # verificarea ruleaza si daca decizia a avut erori: un ordin trimis pentru celalalt simbol

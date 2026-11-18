@@ -271,7 +271,7 @@ PAGINA = """<!DOCTYPE html>
   <div class="banda">
     <b>Robot RSI2 pe SPY și QQQ — doar paper.</b>
     Serviciul <code>robot-rsi2</code>: <b class="{{ 'verde' if r.serviciu == 'active' else 'rosu' }}">{{ r.serviciu }}</b>
-    · decizie zilnică la 15:44 ET (22:44 ora RO), ordine la închidere · 10.000 USD/simbol · fără stop
+    · decizie zilnică la 15:44 ET (22:44 ora RO), ordin market imediat (din 18 nov; paper nu execută ordinele la închidere) · 10.000 USD/simbol · fără stop
   </div>
   <div class="carduri">
     <div class="card"><div class="eticheta">Poziții deschise</div><div class="valoare">{{ r.stare.pozitii|length }}</div></div>
